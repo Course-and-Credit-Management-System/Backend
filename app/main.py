@@ -4,24 +4,19 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.core.config import get_settings
+from app.core.config import settings
 from app.core.database import init_db, close_db
 from app.api import api_router
-
-settings = get_settings()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler for startup and shutdown events."""
-    # Startup
     await init_db()
     yield
-    # Shutdown
     await close_db()
 
 
-# Create FastAPI application
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
@@ -32,22 +27,23 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Add CORS middleware
+# ✅ IMPORTANT RULE:
+# If allow_credentials=True, allow_origins CANNOT be "*".
+# It must be a list of exact origins, e.g.:
+# "http://localhost:3000", "http://192.168.31.172:3000"
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
-# Include API routers
 app.include_router(api_router, prefix="/api/v1")
 
 
 @app.get("/")
 async def root():
-    """Root endpoint."""
     return {
         "message": f"Welcome to {settings.APP_NAME}",
         "version": settings.APP_VERSION,

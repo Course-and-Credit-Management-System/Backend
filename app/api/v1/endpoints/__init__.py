@@ -1,4 +1,3 @@
-"""API v1 router aggregation."""
 from fastapi import APIRouter
 
 from app.api.v1.endpoints import health, users
@@ -7,10 +6,10 @@ from app.api.v1.endpoints.admin.dashboard import router as admin_dashboard_route
 
 api_router = APIRouter()
 
-# existing
+# existing routers
 api_router.include_router(health.router, prefix="/health", tags=["health"])
 api_router.include_router(users.router, prefix="/users", tags=["users"])
 
-# new
-api_router.include_router(auth_router)             # prefix="/auth" is inside endpoints/auth.py
-api_router.include_router(admin_dashboard_router)  # prefix="/admin" is inside endpoints/admin/dashboard.py
+# new routers
+api_router.include_router(auth_router)            # already has prefix="/auth"
+api_router.include_router(admin_dashboard_router) # already has prefix="/admin"
