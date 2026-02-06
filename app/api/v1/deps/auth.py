@@ -1,17 +1,37 @@
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 
 from app.core.config import settings
 from app.core.database import get_database
 
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)  # ✅ don't auto-throw if header missing
+
+
+def _get_token_from_request(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None,
+) -> str | None:
+    # ✅ 1) Prefer cookie auth (your main architecture)
+    cookie_token = request.cookies.get(settings.COOKIE_NAME)  # "access_token"
+    if cookie_token:
+        return cookie_token
+
+    # ✅ 2) Fallback: allow Authorization: Bearer for Swagger/manual testing
+    if credentials:
+        return credentials.credentials
+
+    return None
 
 
 async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
 ):
-    token = credentials.credentials
+    token = _get_token_from_request(request, credentials)
+
+    if not token:
+        raise HTTPException(status_code=403, detail="Not authenticated")
 
     try:
         payload = jwt.decode(
@@ -30,12 +50,14 @@ async def get_current_user(
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
 
+    cred = await db["AuthCredentials"].find_one({"user_id": user_id})
+    user["must_reset_password"] = bool(cred.get("must_reset_password")) if cred else False
+
     user.pop("password_hash", None)
     user["_id"] = str(user.get("_id"))
     return user
 
 
-# ✅ this is what your admin files are trying to import
 async def require_admin(current_user=Depends(get_current_user)):
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
