@@ -42,3 +42,11 @@ async def get_db():
     if client is None:
         await init_db()
     return client[settings.MONGODB_DB_NAME]
+
+
+async def get_database():
+    """
+    Compatibility alias used by endpoints/services.
+    Returns the MongoDB database instance.
+    """
+    return await get_db()
