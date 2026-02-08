@@ -9,6 +9,7 @@ from app.models.course import Course
 from app.models.enrollment import Enrollment
 from app.models.announcement import Announcement
 from app.models.message import Message
+from app.models.student_result import StudentResultDB
 
 settings = get_settings()
 
@@ -46,7 +47,8 @@ async def init_db():
             Course,
             Enrollment,
             Announcement,
-            Message
+            Message,
+            StudentResultDB,
         ]
     )
 
