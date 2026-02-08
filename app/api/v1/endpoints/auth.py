@@ -16,6 +16,13 @@ from app.core.reset_tokens import generate_reset_token, hash_token, get_expiry_t
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
+async def _get_col(db, names: list[str]):
+    cols = await db.list_collection_names()
+    for n in names:
+        if n in cols:
+            return db[n]
+    # default to first name
+    return db[names[0]]
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr
 
@@ -57,11 +64,16 @@ async def login(payload: dict, response: Response):
         raise HTTPException(status_code=422, detail="username, password, role are required")
 
     db = await get_database()
-    users = db["Users"]
-    creds = db["AuthCredentials"]
+    users = await _get_col(db, ["Users", "users"])
+    creds = await _get_col(db, ["AuthCredentials", "authcredentials"])
 
     user = await users.find_one(
-        {"$or": [{"user_id": username}, {"email": username}], "role": role}
+        {
+            "$and": [
+                {"$or": [{"user_id": username}, {"email": username}]},
+                {"role": {"$regex": f"^{role}$", "$options": "i"}},
+            ]
+        }
     )
     if not user:
         # Try finding without role to see if it's a role mismatch
@@ -112,6 +124,7 @@ async def login(payload: dict, response: Response):
 
     return {
         "token_type": "cookie",
+        "access_token": access_token,
         "must_reset_password": bool(cred.get("must_reset_password", False)),
         "user": user_out,
     }

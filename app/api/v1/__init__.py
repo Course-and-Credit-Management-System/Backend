@@ -1,7 +1,7 @@
 """API v1 router aggregation."""
 from fastapi import APIRouter
 
-from app.api.v1.endpoints import health, users
+from app.api.v1.endpoints import health, users, student
 from app.api.v1.endpoints.auth import router as auth_router
 from app.api.v1.endpoints.admin.dashboard import router as admin_dashboard_router
 from app.api.v1.endpoints.admin.courses import router as admin_courses_router
@@ -25,3 +25,5 @@ api_router.include_router(admin_messages_router)
 
 # Student
 api_router.include_router(student_courses_router)
+api_router.include_router(student.router, prefix="/student", tags=["student"])
+
