@@ -46,6 +46,14 @@ class Settings(BaseSettings):
     COOKIE_SECURE: bool = False
     COOKIE_SAMESITE: str = "lax"  # "lax" is best for local dev
 
+    # --- Email / SMTP (Mailtrap now, SendGrid later) ---
+    SMTP_HOST: str
+    SMTP_PORT: int = 2525
+    SMTP_USER: str
+    SMTP_PASS: str
+    FROM_EMAIL: str 
+    FRONTEND_URL: str
+
     class Config:
         env_file = ".env"
         case_sensitive = True
