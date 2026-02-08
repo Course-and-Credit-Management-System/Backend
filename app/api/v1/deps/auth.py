@@ -7,6 +7,13 @@ from app.core.database import get_database
 
 security = HTTPBearer(auto_error=False)  # ✅ don't auto-throw if header missing
 
+async def _get_col(db, names: list[str]):
+    cols = await db.list_collection_names()
+    for n in names:
+        if n in cols:
+            return db[n]
+    return db[names[0]]
+
 
 def _get_token_from_request(
     request: Request,
@@ -46,11 +53,13 @@ async def get_current_user(
         raise HTTPException(status_code=401, detail="Invalid token")
 
     db = await get_database()
-    user = await db["Users"].find_one({"user_id": user_id})
+    users = await _get_col(db, ["Users", "users"])
+    user = await users.find_one({"user_id": user_id})
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
 
-    cred = await db["AuthCredentials"].find_one({"user_id": user_id})
+    creds = await _get_col(db, ["AuthCredentials", "authcredentials"])
+    cred = await creds.find_one({"user_id": user_id})
     user["must_reset_password"] = bool(cred.get("must_reset_password")) if cred else False
 
     user.pop("password_hash", None)
