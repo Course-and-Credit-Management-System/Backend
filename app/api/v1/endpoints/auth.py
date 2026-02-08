@@ -35,8 +35,11 @@ async def login(payload: dict, response: Response):
     username = payload.get("username")
     password = payload.get("password")
     role = payload.get("role")
+    
+    print(f"LOGIN DEBUG: Attempting login for user='{username}', role='{role}'")
 
     if not username or not password or not role:
+        print("LOGIN DEBUG: Missing fields")
         raise HTTPException(status_code=422, detail="username, password, role are required")
 
     db = await get_database()
@@ -47,8 +50,15 @@ async def login(payload: dict, response: Response):
         {"$or": [{"user_id": username}, {"email": username}], "role": role}
     )
     if not user:
+        # Try finding without role to see if it's a role mismatch
+        user_check = await users.find_one({"$or": [{"user_id": username}, {"email": username}]})
+        if user_check:
+             print(f"LOGIN DEBUG: User found but ROLE MISMATCH. DB role: '{user_check.get('role')}', Request role: '{role}'")
+        else:
+             print("LOGIN DEBUG: User NOT found in 'Users' collection")
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
+    print(f"LOGIN DEBUG: User found: {user.get('_id')}")
     cred = await creds.find_one({"user_id": user["user_id"]})
 
     # First-time bootstrap: create credentials with DEFAULT_PASSWORD
@@ -68,6 +78,9 @@ async def login(payload: dict, response: Response):
         await creds.insert_one(cred)
 
     if not verify_password(password, cred["password_hash"]):
+        print(f"LOGIN DEBUG: Password verification failed for user {username}")
+        # print(f"  Input: {password}")
+        # print(f"  Hash:  {cred['password_hash']}")
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     expire = datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)

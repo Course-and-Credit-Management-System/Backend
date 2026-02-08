@@ -7,6 +7,7 @@ from app.api.v1.endpoints.admin.dashboard import router as admin_dashboard_route
 from app.api.v1.endpoints.admin.courses import router as admin_courses_router
 from app.api.v1.endpoints.admin.announcements import router as admin_announcements_router
 from app.api.v1.endpoints.admin.messages import router as admin_messages_router
+from app.api.v1.endpoints.student import courses_router as student_courses_router
 
 
 api_router = APIRouter()
@@ -21,3 +22,6 @@ api_router.include_router(admin_dashboard_router)  # prefix="/admin" is inside e
 api_router.include_router(admin_courses_router)
 api_router.include_router(admin_announcements_router)
 api_router.include_router(admin_messages_router)
+
+# Student
+api_router.include_router(student_courses_router)
