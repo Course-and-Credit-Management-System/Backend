@@ -23,6 +23,8 @@ class Course(Document):
     syllabus: List[Dict[str, Any]] = []  # [{"week": Int, "topic": String}]
     instructor: Optional[str] = None
     room: Optional[str] = None
+    description: Optional[str] = None
+    department: Optional[str] = None
 
     class Settings:
         name = "Courses"

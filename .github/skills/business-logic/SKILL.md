@@ -26,10 +26,16 @@ Courses are categorized into four types:
 - **Subject Limits**: Maximum of **8 subjects** per semester.
 - **Failure Penalty**: If a student fails 3 subjects in a semester, they are limited to **5 new subjects** in the next cycle (Total 8: 3 retakes + 5 new).
 - **Priority Logic**: Students must prioritize Retake Subjects over Core or Electives.
-- **Sequence Handling**: If a student fails a course in Semester VII (odd), they proceed to Semester VIII (even) and return to the failed subjects in Semester IX.
-- **Conflict Resolution**: If enrollment exceeds 18 credits, a **Trade-off Decision** module is triggered to assist in dropping electives for retakes.
+- **Sequence Handling**: 
+  - **Term Parity Rule**: Retake courses are season-dependent. A course failed in an **Odd Semester** (First Sem) can only be retaken in a subsequent **Odd Semester**. Same applies for Even Semesters.
+  - *Example*: Fail in Sem 1 -> Retake in Sem 3 (not Sem 2).
+- **Conflict Resolution**: If enrollment exceeds 18 credits, a **Trade-off Decision** module is triggered.
 
 ### 4. Grading & History
+- **Enrollment Persistence (Soft Delete)**: 
+  - **CRITICAL**: Enrollments are never hard-deleted from the database during a "Drop" action.
+  - **Action**: Set `status = "Dropped"`.
+  - **Reason**: Hard deletion causes the Auto-Enroller to detect the course as "missing" and erroneously re-enroll the student immediately.
 - **Grade Replacement**: New grades update the student's overall GPA.
 - **Formulas**: 
   - `Grade Points Earned = Grade Points × Credits Earned`.

@@ -2,7 +2,7 @@
 
 This document documents the specific architectural decisions, common bugs, and fixes encountered during the development of the FastAPI Backend. Refer to this when creating new endpoints to avoid recurring issues.
 
-## 7. Collection Naming Conventions
+## 0. Collection Naming Conventions
 **CRITICAL:** ALL collection names must be **TitleCase** and match the existing database schema exactly. The database is case-sensitive.
 -   **Enrollments** (not `enrollment` or `enrollments`)
 -   **Courses** (not `courses`)
@@ -104,9 +104,35 @@ If the API returns "Internal Server Error" without a clear valid traceback in th
 If a field structure is dynamic or mixed (like `semester` containing boolean flags alongside string values), avoid strict typing like `List[Dict[str, str]]`.
 Use `List[Dict[str, Any]]` instead to prevent `ValidationError` on read.
 
-### **Idempotent Auto-Enrollment**
+### **Idempotent Auto-Enrollment & Re-Enrollment Prevention**
 When implementing "auto-create" or "initialization" logic (like enrolling students in courses upon their first visit):
-1.  **Do NOT** just check `if not existing_data: create_all()`. This fails if partial data exists.
-2.  **Instead**: Fetch all required items, check which ones are missing from the user's records, and create ONLY the missing ones.
-    *   Find suitable courses used `In` operator or loop check.
-    *   Create `Enrollment` for `course_code` NOT IN existing enrollments.
+
+1.  **Check for Prior Interactions**: Before auto-enrolling, check if the student has *any* records (Active, Dropped, Failed, etc.).
+    *   If **ZERO records** exist: Safe to Auto-Enroll.
+    *   If **ANY records** exist (even if count < expected): Do **NOT** auto-enroll. The student might have manually dropped a course. Auto-enrolling would disrespect their decision.
+
+2.  **Logic Pattern**:
+    ```python
+    existing_enrollments = await Enrollment.find(student_id=...).to_list()
+    if not existing_enrollments:
+        # User is brand new -> Enroll in all default courses
+        await enroll_in_all(defaults)
+    else:
+        # User has history -> Do nothing (or only add strictly new curriculum changes, care required)
+    ```
+
+## 8. Enrollment Dropping Logic
+**CRITICAL:** Never **Hard Delete** enrollment records.
+
+**❌ Incorrect:**
+```python
+await Enrollment.find(...).delete()
+```
+*   **Result:** The record vanishes. The "Auto-Enrollment" logic (see #7) sees a "missing" course and immediately re-enrolls the student on next refresh.
+
+**✅ Correct (Soft Delete):**
+```python
+await Enrollment.find(...).update({"$set": {"status": EnrollmentStatus.DROPPED}})
+# And filter out DROPPED records in your GET /dashboard endpoints.
+```
+*   **Result:** The "tombstone" record persists. The Auto-Enroll logic sees the record exists (so it doesn't re-enroll), but the UI hides it because of the status filter.
