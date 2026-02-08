@@ -1,8 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException
-from app.api.v1.deps.auth import require_admin
+from app.api.v1.deps.auth import require_admin, get_current_user
 from app.core.database import get_database
 from pydantic import BaseModel
-from typing import Any, Optional, List, Union
+from typing import Any, Optional, List, Union, Dict
 from pymongo.errors import WriteError
 
 
@@ -36,8 +36,33 @@ class CourseUpdate(BaseModel):
     description: Optional[str] = None
     prerequisites: Optional[List[str]] = None
 
+class CourseDetailsResponse(BaseModel):
+    course_code: str
+    title: str
+    instructor: Optional[str] = None
+    credits: float
+    # Helper handles both string or list, but response will be list ideally or match frontend
+    # Frontend Types.ts says: string[] | string
+    schedule: Union[List[str], str] = []
+    room: Optional[str] = None
+    description: Optional[str] = None
+    syllabus: List[Dict[str, Any]] = []
+    prerequisites: List[str] = []
+    type: Optional[str] = None
+    department: Optional[str] = None
 
 
+@router.get("/courses/{course_code}", response_model=CourseDetailsResponse)
+async def get_course_details(course_code: str, _admin=Depends(require_admin)):
+    # Import Course model inside function or at top (checking imports)
+    # We need to ensure Course is imported. It is NOT imported in the read_file output above.
+    from app.models.course import Course
+    
+    course = await Course.find_one(Course.course_code == course_code)
+    if not course:
+        raise HTTPException(status_code=404, detail=f"Course {course_code} not found")
+    
+    return course
 
 @router.get("/courses")
 async def list_courses(_admin=Depends(require_admin)):
