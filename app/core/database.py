@@ -29,6 +29,14 @@ async def init_db():
     await client.admin.command('ping')
     print("Successfully connected to MongoDB!")
     
+        # 🔐 CREATE INDEXES FOR PASSWORD RESET TOKENS (NEW)
+    await database["ResetTokens"].create_index("token_hash", unique=True)
+    await database["ResetTokens"].create_index([("user_id", 1), ("created_at", -1)])
+    await database["ResetTokens"].create_index("expires_at")
+
+    print("ResetTokens indexes ensured.")
+
+    
     # Initialize Beanie with document models
     await init_beanie(
         database=database,
