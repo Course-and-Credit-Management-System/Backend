@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
 
     # Password bootstrap (only for first-time login)
-    DEFAULT_PASSWORD: str = "Default@123"
+    DEFAULT_PASSWORD: str = "admin123"
 
     # Cookie
     COOKIE_NAME: str = "access_token"

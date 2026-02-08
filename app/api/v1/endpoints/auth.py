@@ -10,6 +10,14 @@ from app.api.v1.deps.auth import get_current_user
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
+async def _get_col(db, names: list[str]):
+    cols = await db.list_collection_names()
+    for n in names:
+        if n in cols:
+            return db[n]
+    # default to first name
+    return db[names[0]]
+
 
 def _cookie_params():
     """
@@ -32,19 +40,24 @@ def _cookie_params():
 
 @router.post("/login")
 async def login(payload: dict, response: Response):
-    username = payload.get("username")
-    password = payload.get("password")
-    role = payload.get("role")
+    username = (payload.get("username") or "").strip()
+    password = payload.get("password") or ""
+    role = (payload.get("role") or "").strip()
 
     if not username or not password or not role:
         raise HTTPException(status_code=422, detail="username, password, role are required")
 
     db = await get_database()
-    users = db["Users"]
-    creds = db["AuthCredentials"]
+    users = await _get_col(db, ["Users", "users"])
+    creds = await _get_col(db, ["AuthCredentials", "authcredentials"])
 
     user = await users.find_one(
-        {"$or": [{"user_id": username}, {"email": username}], "role": role}
+        {
+            "$and": [
+                {"$or": [{"user_id": username}, {"email": username}]},
+                {"role": {"$regex": f"^{role}$", "$options": "i"}},
+            ]
+        }
     )
     if not user:
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -85,6 +98,7 @@ async def login(payload: dict, response: Response):
 
     return {
         "token_type": "cookie",
+        "access_token": access_token,
         "must_reset_password": bool(cred.get("must_reset_password", False)),
         "user": user_out,
     }

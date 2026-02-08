@@ -1,20 +1,15 @@
 """User CRUD endpoints."""
 from typing import List
-from datetime import datetime
+from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, status
 from bson import ObjectId
 
 from app.models.user import User
 from app.schemas.user import UserCreate, UserUpdate, UserResponse
+from app.core.database import get_database
+from app.core.security import hash_password
 
 router = APIRouter()
-
-
-def hash_password(password: str) -> str:
-    """Simple password hashing - replace with proper bcrypt in production."""
-    # In production, use: from passlib.context import CryptContext
-    # pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-    return f"hashed_{password}"
 
 
 @router.post("/", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
@@ -36,16 +31,33 @@ async def create_user(user_data: UserCreate):
             detail="User with this username already exists"
         )
     
+    # Hash password properly
+    pwd_hash = hash_password(user_data.password)
+
     # Create user
     user = User(
         email=user_data.email,
         username=user_data.username,
         full_name=user_data.full_name,
-        hashed_password=hash_password(user_data.password),
+        hashed_password=pwd_hash,
         is_active=user_data.is_active,
+        # Ensure user_id is set (assuming username is the ID, or generate one)
+        user_id=user_data.username 
     )
     
     await user.insert()
+
+    # Create AuthCredential so the user can actually login
+    db = await get_database()
+    creds = db["AuthCredentials"]
+    await creds.insert_one({
+        "user_id": user.user_id,
+        "password_hash": pwd_hash,
+        "must_reset_password": False,
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    })
+
     return user
 
 
