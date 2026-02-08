@@ -23,6 +23,8 @@ class Settings(BaseSettings):
 
         # ✅ your current frontend (from screenshot)
         "http://192.168.31.172:3000",
+        "http://localhost:3000",
+        "http://localhost:3001",
 
         # (optional but useful)
         "http://localhost:3000",
