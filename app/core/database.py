@@ -4,6 +4,11 @@ from beanie import init_beanie
 
 from app.core.config import get_settings
 from app.models.user import User
+from app.models.major import Major
+from app.models.course import Course
+from app.models.enrollment import Enrollment
+from app.models.announcement import Announcement
+from app.models.message import Message
 
 settings = get_settings()
 
@@ -35,7 +40,14 @@ async def init_db():
     # Initialize Beanie with document models
     await init_beanie(
         database=database,
-        document_models=[User]
+        document_models=[
+            User,
+            Major,
+            Course,
+            Enrollment,
+            Announcement,
+            Message
+        ]
     )
 
 
