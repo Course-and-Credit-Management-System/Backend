@@ -136,3 +136,38 @@ await Enrollment.find(...).update({"$set": {"status": EnrollmentStatus.DROPPED}}
 # And filter out DROPPED records in your GET /dashboard endpoints.
 ```
 *   **Result:** The "tombstone" record persists. The Auto-Enroll logic sees the record exists (so it doesn't re-enroll), but the UI hides it because of the status filter.
+
+
+## 9. Course Enrollment & Business Rules
+
+### **Filters & Sorting**
+- **Filtering**: Server-side string searching (`q`) is removed; search is handled by frontend.
+- **Sorting**: `sort="enrollable"` is a strict filter.
+  - **Action**: Returns ONLY courses where `enrollable: true`.
+  - **Ordering**: Alphabetical by `code`.
+
+### **Validation Rules (Parity & Version)**
+To determine if a user can enroll (Status: "normal"):
+1.  **Parity Match**: 
+    -   If User Profile is "First Sem" -> Can only enroll in "First Sem" (matches "1st Sem" etc) courses.
+    -   If User Profile is "Second Sem" -> Can only enroll in "Second Sem" (matches "2nd Sem" etc) courses.
+    -   *Message if Closed*: `"this course has been closed"`.
+2.  **Version Match**:
+    -   If User Profile is "(new)" -> Course must match "(new)" or be version-agnostic.
+    -   If User Profile is "(old)" -> Course must match "(old)" or be version-agnostic.
+    -   *Message if Mismatch*: `"this course is for old student"` or `"this course is for new student"`.
+
+### **"Already Taken" vs "Failed"**
+A course is considered **"Already Taken"** if it exists in the user's Global Academic History (regardless of status).
+
+**Enrollable Boolean Calculations (`enrollable`):**
+| Status in History | `enrollable` | Message |
+| :--- | :--- | :--- |
+| **Passed / Completed** | `false` | `"this course is already been taken"` |
+| **Failed / F** | `true` | *None* (Retake allowed) |
+| **No Status** (Legacy) | `false` | `"this course is already been taken"` |
+| **Not in History** | `true` (if Valid Context) | *None* |
+
+### **Priority of Messages**
+1.  **"Already Taken"**: Always shown first if the course exists in history.
+2.  **"Closed / Version Mismatch"**: Shown if not taken, but context prevents enrollment.
