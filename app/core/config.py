@@ -29,6 +29,7 @@ class Settings(BaseSettings):
         # (optional but useful)
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+        "http://127.0.0.1:3001",
         "http://192.168.31.172:5173",
     ]
 
@@ -39,7 +40,7 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
 
     # Password bootstrap (only for first-time login)
-    DEFAULT_PASSWORD: str = "admin123"
+    DEFAULT_PASSWORD: str = "Admin123"
 
     # Cookie
     COOKIE_NAME: str = "access_token"
