@@ -16,9 +16,23 @@ from app.api.v1.deps.auth import get_current_user
 
 router = APIRouter()
 
+async def _get_col(db, names: list[str]):
+    cols = await db.list_collection_names()
+    for n in names:
+        if n in cols:
+            return db[n]
+    return db[names[0]]
+
 def _map_student_record(data: dict) -> schemas.CompleteAcademicRecord:
     profile = data.get("student_profile") or {}
+    
+    # Handle both processed data and raw academic_history
     semesters_in = data.get("academic_history") or []
+    
+    # If academic_history is empty but user has raw academic_history, use that
+    if not semesters_in and "academic_history" in data:
+        semesters_in = data["academic_history"]
+    
     semesters_map = {}
     for entry in semesters_in:
         sem = entry.get("semester") or ""
@@ -29,23 +43,25 @@ def _map_student_record(data: dict) -> schemas.CompleteAcademicRecord:
     for sem_name, entries in semesters_map.items():
         results_out: List[schemas.StudentResult] = []
         for r in entries:
-            # Use static credit unit of 3 for all courses
-            credits = 3
+            # Credits should only count for completed/passed courses
+            status_val = (r.get("status") or "").strip()
+            credits = r.get("credits", 3) or 3
+            countable_statuses = {"Completed", "Passed"}
             grade_val = r.get("grade") or ""
-            gp = calculate_course_points(grade_val, 1) if grade_val else 0.0
-            gpe = calculate_course_points(grade_val, credits) if grade_val else 0.0
+            gp = calculate_course_points(grade_val, 1) if (grade_val and status_val in countable_statuses) else 0.0
+            gpe = calculate_course_points(grade_val, credits) if (grade_val and status_val in countable_statuses) else 0.0
             results_out.append(
                 schemas.StudentResult(
                     course_code=r.get("course_code") or r.get("code") or "",
                     course_title=r.get("course_title") or r.get("title"),
                     grade=grade_val,
                     points=gp,
-                    status=r.get("status") or "Completed",
+                    status=status_val or "Unknown",
                     result_tag=get_result_tag(r.get("grade") or ""),
                     review_status=r.get("review_status") or "None",
                     lecture_hours=2,
                     tda_hours=2,
-                    credit_unit=credits,
+                    credit_unit=credits if status_val in countable_statuses else 0,
                     grade_points_earned=gpe,
                 )
             )
@@ -84,19 +100,61 @@ def _map_student_record(data: dict) -> schemas.CompleteAcademicRecord:
 
 async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas.CompleteAcademicRecord:
     db = await get_database()
-    users = db["Users"]
-    doc = None
-
+    users = await _get_col(db, ["Users", "users"])
+    enrollments = await _get_col(db, ["Enrollments", "enrollments"])
+    courses = await _get_col(db, ["Courses", "courses"])
+    
+    # Get user info
+    user_doc = None
     if user_id:
-        doc = await users.find_one({"user_id": user_id})
-        if not doc and ObjectId.is_valid(user_id):
-            doc = await users.find_one({"_id": ObjectId(user_id)})
+        user_doc = await users.find_one({"user_id": user_id})
+        if not user_doc and ObjectId.is_valid(user_id):
+            user_doc = await users.find_one({"_id": ObjectId(user_id)})
 
-    if not doc:
+    if not user_doc:
         return get_mock_academic_record()
     
+    # Get student's enrollments (support multiple possible field names)
+    enroll_query = {
+        "$or": [
+            {"student_id": user_id},
+            {"student_user_id": user_id},
+            {"user_id": user_id},
+        ]
+    }
+    enrollment_records = await enrollments.find(enroll_query).to_list(None)
+    
+    if not enrollment_records:
+        return get_mock_academic_record()
+    
+    # Build academic history from enrollments
+    academic_history = []
+    for enrollment in enrollment_records:
+        # Resolve course doc robustly by _id or course_code
+        course_id_or_code = enrollment.get("course_id", "") or enrollment.get("course_code", "")
+        course = None
+        if course_id_or_code:
+            course = await courses.find_one({"_id": course_id_or_code})
+            if not course:
+                course = await courses.find_one({"course_code": course_id_or_code})
+        
+        academic_history.append({
+            "course_code": (course or {}).get("course_code", course_id_or_code),
+            "course_title": (course or {}).get("title", course_id_or_code),
+            "grade": enrollment.get("grade", ""),
+            "status": enrollment.get("status", "Unknown"),
+            "semester": enrollment.get("semesterAttend", ""),
+            "credits": (course or {}).get("credits", enrollment.get("credits", 3)),
+            "points": enrollment.get("points", 0),
+            "is_retake": enrollment.get("is_retake", False)
+        })
+    
+    # Create a combined document for mapping
+    combined_doc = dict(user_doc)
+    combined_doc["academic_history"] = academic_history
+    
     # Ensure we pass a dict (Motor returns a dict)
-    return _map_student_record(doc)
+    return _map_student_record(combined_doc)
 
 # Mock Data for Multiple Semesters
 def get_mock_academic_record():
@@ -243,27 +301,61 @@ async def get_academic_status():
 
 # 7. Student - Courses & Results
 
-@router.get("/courses/current", response_model=List[schemas.CourseSchedule])
-async def get_current_courses():
+@router.get("/courses/current", response_model=schemas.CourseSchedule)
+async def get_current_courses(current_user=Depends(get_current_user)):
     """
     Returns the current semester's schedule and credits.
     """
-    return [
-        {
-            "course_code": "CST-1010",
-            "title": "Intro to Data Science",
-            "credits": 3.0,
-            "schedule": ["Mon 10:00-11:30", "Wed 10:00-11:30"],
-            "room": "Bldg A, 302"
-        },
-        {
-            "course_code": "CST-2020",
-            "title": "Database Systems",
-            "credits": 3.0,
-            "schedule": ["Tue 13:00-14:30", "Thu 13:00-14:30"],
-            "room": "Bldg B, 101"
+    db = await get_database()
+    enrollments = await _get_col(db, ["Enrollments", "enrollments"])
+    courses = await _get_col(db, ["Courses", "courses"])
+    
+    user_id = current_user.get("user_id")
+    
+    # Get current enrollments for the student (support multiple possible field names)
+    enroll_query = {
+        "$or": [
+            {"student_id": user_id},
+            {"student_user_id": user_id},
+            {"user_id": user_id},
+        ]
+    }
+    enrollment_records = await enrollments.find(enroll_query).to_list(None)
+    
+    current_courses = []
+    total_credits = 0
+    
+    for enrollment in enrollment_records:
+        # Get course details
+        course_id_or_code = enrollment.get("course_id", "") or enrollment.get("course_code", "")
+        course = None
+        if course_id_or_code:
+            # Try by _id first (many datasets store string IDs like "c_004")
+            course = await courses.find_one({"_id": course_id_or_code})
+            # Fallback: some datasets store course_id as course_code (e.g., "CS-101")
+            if not course:
+                course = await courses.find_one({"course_code": course_id_or_code})
+        
+        course_data = {
+            "code": (course or {}).get("course_code", course_id_or_code),
+            "title": (course or {}).get("title", course_id_or_code),
+            "credits": (course or {}).get("credits", enrollment.get("credits", 3)),
+            "instructor": (course or {}).get("instructor", "TBA"),
+            "location": (course or {}).get("room", "TBA"),
+            "is_retake": enrollment.get("is_retake", False),
+            "tag": "Core",
         }
-    ]
+        current_courses.append(course_data)
+        total_credits += course_data["credits"]
+    
+    # Return the structure expected by frontend
+    return {
+        "semester_name": "Current Semester",
+        "total_credits": total_credits,
+        "max_credits": 18,
+        "courses_count": len(current_courses),
+        "courses": current_courses
+    }
 
 @router.get("/results", response_model=schemas.CompleteAcademicRecord)
 async def get_student_results(user_id: Optional[str] = None, current_user=Depends(get_current_user)):
