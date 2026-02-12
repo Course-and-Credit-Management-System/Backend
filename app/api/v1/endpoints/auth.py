@@ -25,6 +25,14 @@ class ResetPasswordWithTokenRequest(BaseModel):
     new_password: str
 
 
+async def _get_col(db, names: list[str]):
+    cols = await db.list_collection_names()
+    for n in names:
+        if n in cols:
+            return db[n]
+    return db[names[0]]
+
+
 def _cookie_params():
     """
     Centralize cookie settings.

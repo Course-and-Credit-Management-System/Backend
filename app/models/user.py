@@ -41,6 +41,8 @@ class AdminProfile(BaseModel):
 class User(Document):
     """User document model for MongoDB."""
     
+    # Explicitly define ID as string to allow custom IDs and prevent PydanticObjectId validation errors
+    id: Optional[str] = Field(default=None, alias="_id")
     user_id: str = Field(..., unique=True, description="Unique Identifier (e.g., 'TNT-8801', 'ADM-001')")
     name: str
     email: EmailStr
