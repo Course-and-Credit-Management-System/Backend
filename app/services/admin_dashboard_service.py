@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Dict, List, Optional
+from datetime import datetime
 
 from app.core.database import get_database
 
@@ -19,6 +20,30 @@ class AdminDashboardService:
     async def create(cls) -> "AdminDashboardService":
         db = await get_database()
         return cls(db)
+
+    # -------------------------
+    # Helpers
+    # -------------------------
+    def _json_safe(self, doc: Any) -> Any:
+        """
+        Convert ObjectId + datetime (and nested) into JSON safe values.
+        """
+        if isinstance(doc, dict):
+            out = {}
+            for k, v in doc.items():
+                if k == "_id":
+                    out[k] = str(v)
+                else:
+                    out[k] = self._json_safe(v)
+            return out
+
+        if isinstance(doc, list):
+            return [self._json_safe(x) for x in doc]
+
+        if isinstance(doc, datetime):
+            return doc.isoformat()
+
+        return doc
 
     async def statistics(self) -> dict[str, Any]:
         total_students = await self.users.count_documents({"role": "student"})
@@ -51,14 +76,10 @@ class AdminDashboardService:
 
     async def major_distribution(self) -> list[dict[str, Any]]:
         """
-        Your DB has:
-        - Majors: _id = "CS", major_name = "Computer Science"
-        - MajorHistories: major_id = "MAJ-CS-001", major_name = "B.S. Computer Science"
-        Users may store either:
-        - student_profile.major_id = "CS" (matches Majors._id)
+        Users may store:
+        - student_profile.major_id = "CS" (Majors._id)
         OR
-        - student_profile.major_id = "MAJ-CS-001" (matches MajorHistories.major_id)
-        So we resolve names with a 2-step lookup.
+        - student_profile.major_id = "MAJ-CS-001" (MajorHistories.major_id)
         """
         pipeline = [
             {"$match": {"role": "student", "student_profile.major_id": {"$exists": True, "$ne": None, "$ne": ""}}},
@@ -72,12 +93,10 @@ class AdminDashboardService:
             major_id = r["_id"]
             major_name = str(major_id)
 
-            # 1) Try Majors collection where _id is like "CS"
             major_doc = await self.majors.find_one({"_id": major_id}, {"major_name": 1})
             if major_doc and major_doc.get("major_name"):
                 major_name = major_doc["major_name"]
             else:
-                # 2) Try MajorHistories where major_id is like "MAJ-CS-001"
                 hist_doc = await self.major_histories.find_one({"major_id": major_id}, {"major_name": 1})
                 if hist_doc and hist_doc.get("major_name"):
                     major_name = hist_doc["major_name"]
@@ -88,37 +107,106 @@ class AdminDashboardService:
 
     async def pending_actions(self) -> dict[str, Any]:
         """
-        We'll return REAL pending signals from your current collections:
+        REAL pending signals:
 
-        - majorChanges: MajorHistories with status == "Transition"
-        - scheduleConflicts: Enrollments with status == "Conflict"
-        - creditOverloads: keep empty for now (needs a clear rule & joins)
+        - majorChanges: MajorHistories where status in ["Transition","Pending"]
+        - scheduleConflicts: Enrollments where status == "Conflict"
         - mustResetPasswords: AuthCredentials where must_reset_password == true
+          -> includes user name/email/role for UI
+        - mustResetPasswordCount: count for badge
         """
 
+        # -------------------------
         # Major change requests
+        # -------------------------
         major_changes = await self.major_histories.find(
-            {"status": {"$in": ["Transition", "Pending"]}}
-        ).limit(50).to_list(length=50)
+            {"status": {"$in": ["Transition", "Pending"]}},
+            {
+                "_id": 1,
+                "major_id": 1,
+                "major_name": 1,
+                "status": 1,
+                "created_at": 1,
+                "updated_at": 1,
+                "student_id": 1,
+                "user_id": 1,
+            },
+        ).sort("updated_at", -1).limit(50).to_list(length=50)
 
+        # -------------------------
         # Conflicting enrollments
+        # -------------------------
         schedule_conflicts = await self.enrollments.find(
-            {"status": "Conflict"}
-        ).limit(50).to_list(length=50)
+            {"status": "Conflict"},
+            {
+                "_id": 1,
+                "student_id": 1,
+                "course_id": 1,
+                "course_code": 1,
+                "status": 1,
+                "created_at": 1,
+                "updated_at": 1,
+                "semester": 1,
+                "year": 1,
+            },
+        ).sort("updated_at", -1).limit(50).to_list(length=50)
 
-        # Must reset password
+        # -------------------------
+        # Must reset password (COUNT + LIST)
+        # IMPORTANT: do NOT return password_hash
+        # -------------------------
         must_reset_password_count = await self.auth_credentials.count_documents({"must_reset_password": True})
 
-        # Clean ObjectId for JSON
-        def clean(doc: dict[str, Any]) -> dict[str, Any]:
-            if "_id" in doc:
-                doc["_id"] = str(doc["_id"])
-            return doc
+        creds = await self.auth_credentials.find(
+            {"must_reset_password": True},
+            {
+                "_id": 1,
+                "user_id": 1,
+                "must_reset_password": 1,
+                "created_at": 1,
+                "updated_at": 1,
+            },
+        ).sort("updated_at", -1).limit(50).to_list(length=50)
 
+        # Join Users for display names/emails
+        must_reset_passwords: List[Dict[str, Any]] = []
+        for c in creds:
+            uid = c.get("user_id")
+
+            # Try user_id match first, then fallback to id
+            user_doc = None
+            if uid:
+                user_doc = await self.users.find_one(
+                    {"user_id": uid},
+                    {"_id": 1, "user_id": 1, "id": 1, "name": 1, "email": 1, "role": 1},
+                )
+                if not user_doc:
+                    user_doc = await self.users.find_one(
+                        {"id": uid},
+                        {"_id": 1, "user_id": 1, "id": 1, "name": 1, "email": 1, "role": 1},
+                    )
+
+            must_reset_passwords.append(
+                {
+                    "id": str(c.get("_id")),
+                    "user_id": uid,
+                    "must_reset_password": True,
+                    "created_at": c.get("created_at"),
+                    "updated_at": c.get("updated_at"),
+                    "user": {
+                        "id": (user_doc or {}).get("user_id") or (user_doc or {}).get("id") or uid,
+                        "name": (user_doc or {}).get("name") or "Unknown",
+                        "email": (user_doc or {}).get("email") or "",
+                        "role": (user_doc or {}).get("role") or "",
+                    },
+                }
+            )
+
+        # JSON-safe all payload parts
         return {
-            "majorChanges": [clean(d) for d in major_changes],
-            "creditOverloads": [],  # will implement once you define the rule/threshold
-            "scheduleConflicts": [clean(d) for d in schedule_conflicts],
+            "majorChanges": self._json_safe(major_changes),
+            "scheduleConflicts": self._json_safe(schedule_conflicts),
+            "mustResetPasswords": self._json_safe(must_reset_passwords),
             "mustResetPasswordCount": must_reset_password_count,
         }
 
@@ -132,7 +220,7 @@ class AdminDashboardService:
             sid = s.get("user_id") or s.get("id")
             sp = s.get("student_profile") or {}
 
-            # ✅ compute earned credits from Passed enrollments
+            # compute earned credits from Passed enrollments
             earned = 0
             if sid:
                 passed = await self.enrollments.find(
@@ -146,30 +234,23 @@ class AdminDashboardService:
                         if course and course.get("credits"):
                             earned += int(course["credits"])
 
-            # put computed fields into student_profile so frontend can read them
             sp["credits_earned"] = earned
-            sp["credits_required"] = sp.get("credits_required") or 120  # default for now
+            sp["credits_required"] = sp.get("credits_required") or 120
             s["student_profile"] = sp
 
         return students
 
-
     async def get_student_details(self, student_id: str):
-        # 1) Find the student in Users
         student = await self.users.find_one({"role": "student", "user_id": student_id})
         if not student:
-            # fallback: some systems store student_id in different fields
             student = await self.users.find_one({"role": "student", "id": student_id})
 
         if not student:
             return None
 
-        # make json-safe
         student["_id"] = str(student.get("_id"))
-
         sp = student.get("student_profile") or {}
 
-        # 2) Resolve major name (supports both Majors and MajorHistories styles)
         major_id = sp.get("major_id") or sp.get("major") or None
         major_name = sp.get("major_name") or None
 
@@ -182,8 +263,6 @@ class AdminDashboardService:
                 if hist_doc and hist_doc.get("major_name"):
                     major_name = hist_doc["major_name"]
 
-        # 3) Get enrollments for this student
-        # Try a few common field names to avoid breaking if schema differs
         enroll_query = {
             "$or": [
                 {"student_id": student_id},
@@ -193,7 +272,6 @@ class AdminDashboardService:
         }
         enrollments = await self.enrollments.find(enroll_query).to_list(length=200)
 
-        # 4) Build UI-friendly enrollment rows
         enrollment_rows = []
         for e in enrollments:
             if "_id" in e:
@@ -201,8 +279,6 @@ class AdminDashboardService:
 
             course_code = e.get("course_id") or e.get("course_code") or ""
             course_doc = None
-
-            # ✅ Your Enrollments.course_id is actually Courses.course_code (ex: "CS-101")
             if course_code:
                 course_doc = await self.courses.find_one({"course_code": course_code})
 
@@ -220,8 +296,6 @@ class AdminDashboardService:
                 }
             )
 
-
-        # 5) Build the response payload used by the frontend page
         payload = {
             "id": student.get("user_id") or student.get("id") or student_id,
             "name": student.get("name", "Unknown"),
