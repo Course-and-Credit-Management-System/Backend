@@ -316,6 +316,49 @@ def get_course_color(course_type: str) -> str:
     if "elective" in ct: return "green"
     return "gray"
 
+def time_to_minutes(t_str: str) -> int:
+    try:
+        t_str = t_str.strip()
+        if ':' in t_str:
+            h, m = map(int, t_str.split(':'))
+            return h * 60 + m
+    except:
+        pass
+    return 0
+
+def parse_schedule_slots(schedule: Optional[List[str]]):
+    slots = []
+    if not schedule: return slots
+    
+    for s in schedule:
+        # Expected: "Mon/Wed 10:00 - 11:30"
+        s_norm = s.replace(' - ', ' ').replace('-', ' ')
+        parts = s_norm.split()
+        
+        if len(parts) >= 3:
+            days_part = parts[0]
+            start_str = parts[-2]
+            end_str = parts[-1]
+            
+            start_min = time_to_minutes(start_str)
+            end_min = time_to_minutes(end_str)
+            
+            days = days_part.split('/')
+            for d in days:
+                d = d.strip()
+                if d:
+                    slots.append((d, start_min, end_min))
+    return slots
+
+def has_schedule_conflict(slots1, slots2) -> bool:
+    for d1, s1, e1 in slots1:
+        for d2, s2, e2 in slots2:
+            if d1 == d2:
+                # Overlap
+                if max(s1, s2) < min(e1, e2):
+                    return True
+    return False
+
 @router.get("", response_model=CourseSearchResponse)
 async def search_courses(
     sort: Optional[str] = None,
@@ -363,6 +406,23 @@ async def search_courses(
     if all_prereq_codes:
         found_prereqs = await Course.find(In(Course.course_code, list(all_prereq_codes))).to_list()
         prereq_titles = {p.course_code: p.title for p in found_prereqs}
+
+    # 4. active enrollments for schedule conflict check
+    active_enrollments = await Enrollment.find(
+        Enrollment.student_id == current_user.get("user_id"),
+        In(Enrollment.status, [EnrollmentStatus.ENROLLED, EnrollmentStatus.PENDING]),
+        Enrollment.semester_attend == user_current_year_str
+    ).to_list()
+    
+    active_course_ids = {e.course_id for e in active_enrollments}
+    course_map = {c.course_code: c for c in courses}
+    
+    busy_slots = []
+    for cid in active_course_ids:
+        if cid in course_map:
+            c_obj = course_map[cid]
+            if c_obj.schedule:
+                busy_slots.extend(parse_schedule_slots(c_obj.schedule))
 
     response_data = []
 
@@ -430,6 +490,13 @@ async def search_courses(
             if req not in passed_courses:
                 missing_prereqs.append(prereq_titles.get(req, req))
         
+        # Check Schedule Conflict
+        is_conflict = False
+        if course.course_code not in active_course_ids:
+            c_slots = parse_schedule_slots(course.schedule)
+            if has_schedule_conflict(c_slots, busy_slots):
+                is_conflict = True
+        
         error_msg = None
         status_str = "normal"
         
@@ -439,6 +506,8 @@ async def search_courses(
         elif missing_prereqs:
             status_str = "locked"
             error_msg = f"Missing Prerequisite: {', '.join(missing_prereqs)}"
+        elif is_conflict:
+             status_str = "locked"
         
         # C. Check if Retake
         already_taken = course.course_code in {h["course_code"] for h in academic_history}
@@ -455,6 +524,8 @@ async def search_courses(
              message_str = "this course is already been taken"
         elif not valid_context:
              message_str = context_message
+        elif is_conflict:
+             message_str = "schedule conflicted"
 
         # Enrollable Logic
         # 1. Must be Normal status (unlocked context, prerequisites met)
