@@ -16,6 +16,28 @@ from app.api.v1.deps.auth import get_current_user
 
 router = APIRouter()
 
+def format_period_display(academic_year: str, semester: str) -> str:
+    """Format period display name for PDF certificates"""
+    # Convert "1st Year, First Sem(new)" to "First Year, First Semester"
+    if "1st Year" in academic_year and "First Sem" in semester:
+        return "First Year, First Semester"
+    elif "1st Year" in academic_year and "Second Sem" in semester:
+        return "First Year, Second Semester"
+    elif "2nd Year" in academic_year and "First Sem" in semester:
+        return "Second Year, First Semester"
+    elif "2nd Year" in academic_year and "Second Sem" in semester:
+        return "Second Year, Second Semester"
+    elif "3rd Year" in academic_year and "First Sem" in semester:
+        return "Third Year, First Semester"
+    elif "3rd Year" in academic_year and "Second Sem" in semester:
+        return "Third Year, Second Semester"
+    elif "4th Year" in academic_year and "First Sem" in semester:
+        return "Fourth Year, First Semester"
+    elif "4th Year" in academic_year and "Second Sem" in semester:
+        return "Fourth Year, Second Semester"
+    # Fallback to original format if no pattern matches
+    return f"{academic_year} ({semester})"
+
 async def _get_col(db, names: list[str]):
     cols = await db.list_collection_names()
     for n in names:
@@ -421,7 +443,7 @@ async def download_certificate_pdf(
         
         certificate_data = schemas.CertificateData(
             student=academic_record.student,
-            period=f"{target_semester.academic_year} ({target_semester.semester})",
+            period=format_period_display(target_semester.academic_year, target_semester.semester),
             semester_result=target_semester
         )
         pdf_buffer = generate_certificate_pdf(certificate_data)
@@ -431,14 +453,28 @@ async def download_certificate_pdf(
         return StreamingResponse(pdf_buffer, media_type="application/pdf", headers=headers)
     
     if (type or "").lower() == "year" and academic_year:
-        year_semesters = [sem for sem in academic_record.academic_summary.semesters if sem.academic_year == academic_year]
+        # Handle year-level matching (e.g., "Second Year" should match "2nd Year, First Sem" and "2nd Year, Second Sem")
+        year_semesters = []
+        for sem in academic_record.academic_summary.semesters:
+            sem_academic_year = sem.academic_year
+            if (academic_year == "First Year" and ("1st Year" in sem_academic_year or "First Year" in sem_academic_year)) or \
+               (academic_year == "Second Year" and ("2nd Year" in sem_academic_year or "Second Year" in sem_academic_year)) or \
+               (academic_year == "Third Year" and ("3rd Year" in sem_academic_year or "Third Year" in sem_academic_year)) or \
+               (academic_year == "Fourth Year" and ("4th Year" in sem_academic_year or "Fourth Year" in sem_academic_year)):
+                year_semesters.append(sem)
+        
+        # Fallback to exact match if no year-level matches found
+        if not year_semesters:
+            year_semesters = [sem for sem in academic_record.academic_summary.semesters if sem.academic_year == academic_year]
+        
         if not year_semesters:
             raise HTTPException(status_code=404, detail=f"No semesters found for academic year {academic_year}")
+        
         summary = calculate_academic_summary(year_semesters)
         year_record = schemas.CompleteAcademicRecord(student=academic_record.student, academic_summary=summary)
         pdf_buffer = generate_complete_transcript_pdf(year_record)
         headers = {
-            'Content-Disposition': f'attachment; filename="grading_certificate_{academic_year}.pdf"'
+            'Content-Disposition': f'attachment; filename="grading_certificate_{academic_year.replace(' ', '_')}.pdf"'
         }
         return StreamingResponse(pdf_buffer, media_type="application/pdf", headers=headers)
     
@@ -583,4 +619,120 @@ async def get_enrollment_alerts():
     return {
         "warnings": ["Max credit limit reached (18/18)"],
         "retakes": ["CST-1005 (Failed last semester)"]
+    }
+
+@router.get("/progress")
+async def get_degree_progress(current_user=Depends(get_current_user)):
+    """
+    Calculate student's degree progress percentage.
+    
+    Returns:
+    - Total courses (Core + Elective) from Courses collection
+    - Completed courses (from Enrollment with status="Passed" or user's academic_history)
+    - Progress percentage for each category
+    - Overall progress
+    """
+    print("PROGRESS DEBUG: Endpoint called!")
+    
+    if current_user.get("role") != "student":
+        raise HTTPException(status_code=403, detail="Student access required")
+    
+    student_id = current_user.get("user_id")
+    print(f"PROGRESS DEBUG: Student ID: {student_id}")
+    print(f"PROGRESS DEBUG: User has academic_history: {bool(current_user.get('academic_history'))}")
+    if current_user.get('academic_history'):
+        print(f"PROGRESS DEBUG: Academic history length: {len(current_user.get('academic_history', []))}")
+    
+    db = await get_database()
+    
+    # Get collections
+    courses_col = await _get_col(db, ["Courses", "courses"])
+    enrollment_col = await _get_col(db, ["Enrollment", "enrollment"])
+    
+    # Get all courses and categorize them
+    all_courses = []
+    async for course in courses_col.find({}):
+        all_courses.append(course)
+    
+    # Separate core and elective courses
+    core_courses = [c for c in all_courses if c.get("type", "").lower() == "core"]
+    elective_courses = [c for c in all_courses if c.get("type", "").lower() == "elective"]
+    
+    # Get student's passed courses from enrollment
+    passed_enrollments = []
+    async for enrollment in enrollment_col.find({
+        "student_id": student_id,
+        "status": "Passed"
+    }):
+        passed_enrollments.append(enrollment)
+    
+    # If no enrollments found, use academic_history from user data
+    if not passed_enrollments and current_user.get("academic_history"):
+        academic_history = current_user.get("academic_history", [])
+        # Convert academic_history entries to enrollment-like format
+        for course_entry in academic_history:
+            if course_entry.get("status") in ["Completed", "Passed"]:
+                passed_enrollments.append({
+                    "course_id": course_entry.get("course_id"),
+                    "course_code": course_entry.get("course_code"),
+                    "status": course_entry.get("status"),
+                    "grade": course_entry.get("grade"),
+                    "credits": course_entry.get("credits")
+                })
+    
+    # Get passed course IDs (try both course_id and course_code)
+    passed_course_ids = []
+    for enrollment in passed_enrollments:
+        course_id = enrollment.get("course_id") or enrollment.get("course_code")
+        if course_id:
+            passed_course_ids.append(course_id)
+    
+    # Count completed courses by type
+    completed_core = 0
+    completed_elective = 0
+    
+    for course_id in passed_course_ids:
+        # Find the course to determine its type
+        # Try multiple matching strategies
+        course = None
+        for c in all_courses:
+            if (c.get("course_code") == course_id or 
+                c.get("_id") == course_id or
+                c.get("course_code") == course_id):
+                course = c
+                break
+        
+        if course:
+            if course.get("type", "").lower() == "core":
+                completed_core += 1
+            elif course.get("type", "").lower() == "elective":
+                completed_elective += 1
+    
+    # Calculate percentages
+    total_core = len(core_courses)
+    total_elective = len(elective_courses)
+    total_courses = total_core + total_elective
+    
+    core_percentage = (completed_core / total_core * 100) if total_core > 0 else 0
+    elective_percentage = (completed_elective / total_elective * 100) if total_elective > 0 else 0
+    overall_percentage = ((completed_core + completed_elective) / total_courses * 100) if total_courses > 0 else 0
+    
+    return {
+        "student_id": student_id,
+        "total_courses": {
+            "core": total_core,
+            "elective": total_elective,
+            "overall": total_courses
+        },
+        "completed_courses": {
+            "core": completed_core,
+            "elective": completed_elective,
+            "overall": completed_core + completed_elective
+        },
+        "progress_percentage": {
+            "core": round(core_percentage, 2),
+            "elective": round(elective_percentage, 2),
+            "overall": round(overall_percentage, 2)
+        },
+        "passed_course_details": passed_enrollments
     }
