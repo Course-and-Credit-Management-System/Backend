@@ -1,5 +1,5 @@
 from typing import Optional
-from beanie import Document
+from beanie import Document, PydanticObjectId
 from pydantic import Field
 from enum import Enum
 
@@ -31,15 +31,33 @@ class Grade(str, Enum):
     ABS = "Abs"
 
 class Enrollment(Document):
+    id: Optional[PydanticObjectId] = Field(default=None, alias="_id")
     student_id: str = Field(..., description="Ref to User.user_id")
     course_id: str = Field(..., description="Ref to Course.course_code")
     semester_attend: str = Field(..., alias="semesterAttend", description="e.g., 'First Year, First Sem(old)'")
     is_retake: bool = False
     status: EnrollmentStatus
-    grade: Optional[Grade] = None
-    points: Optional[float] = None  # Grade points for GPA (e.g., 4.0, 2.33)
-    scores: Optional[float] = None  # Raw numeric score (e.g., 85.5)
+    
+    # Validation fix: MongoDB schema validation requires these to be explicit strings/numbers/nulls?
+    # Actually, the error shows "consideredValue": None, "reason": "type did not match" (expected string/double/int)
+    # The MongoDB schema does NOT list them as optional/nullable in 'required' array?
+    # Wait, they are NOT in 'required' array, but 'bsonType' validation fails for null if 'null' is not in bsonType list.
+    
+    # We must allow None in Python Pydantic, but MongoDB validation rejects strict types if value is None (Null).
+    # Since we cannot change MongoDB schema easily right now, we can try to omit them if None
+    # OR change the default.
+    # But usually, if they are not in `required`, missing them is fine. The issue is `insert` sends `null`.
+    
+    grade: Optional[Grade] = Field(default=None)
+    points: Optional[float] = Field(default=None)
+    scores: Optional[float] = Field(default=None)
 
     class Settings:
-        name = "enrollments"
+        name = "Enrollments"
         indexes = ["student_id", "course_id", "status"]
+        use_state_management = True
+        validate_on_save = True
+
+    class Config:
+        populate_by_name = True
+

@@ -1,7 +1,8 @@
 from passlib.context import CryptContext
 
-# Argon2 only. No bcrypt anywhere.
-pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
+# Support both argon2 and bcrypt for verification.
+# New hashes will use argon2 (stronger), but existing bcrypt hashes remain valid.
+pwd_context = CryptContext(schemes=["argon2", "bcrypt"], deprecated="auto")
 
 
 def hash_password(password: str) -> str:

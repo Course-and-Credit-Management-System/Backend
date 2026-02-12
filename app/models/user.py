@@ -57,7 +57,7 @@ class User(Document):
     major_history: List[MajorHistory] = []
 
     class Settings:
-        name = "users"
+        name = "Users"
         indexes = [
             "user_id",
             "email",

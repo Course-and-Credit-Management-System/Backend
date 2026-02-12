@@ -1,5 +1,10 @@
 # MongoDB Atlas Setup Instructions
 
+## Schema & Collections
+This project assumes strict collection naming. Ensure your collections are named:
+- `Courses`
+- `Enrollments`
+
 ## Option 1: MongoDB Atlas (Recommended for Cloud)
 1. Go to https://www.mongodb.com/atlas and sign up for free
 2. Create a new cluster (free tier available)
