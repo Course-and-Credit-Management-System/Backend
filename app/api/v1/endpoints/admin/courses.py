@@ -1,12 +1,27 @@
-from fastapi import APIRouter, Depends, HTTPException
-from app.api.v1.deps.auth import require_admin, get_current_user
-from app.core.database import get_database
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from typing import Any, Optional, List, Union, Dict
-from pymongo.errors import WriteError
+from typing import Any, Optional, List, Union
 
+from app.api.v1.deps.auth import require_admin
+from app.services.admin_courses_service import (
+    list_courses,
+    get_course,
+    create_course,
+    update_course,
+    delete_course,
+)
 
 router = APIRouter(prefix="/admin", tags=["admin-courses"])
+
+
+class SyllabusItem(BaseModel):
+    week: int
+    topic: str
+
+
+# ✅ Semester item matches Mongo validator: [{ "semester": "..." }]
+class SemesterItem(BaseModel):
+    semester: str
 
 
 class CourseCreate(BaseModel):
@@ -17,12 +32,18 @@ class CourseCreate(BaseModel):
     type: str
     instructor: Optional[str] = None
 
-    # ✅ accept both, but we'll store as array to satisfy Mongo validator
+    # accept both but store as array in service
     schedule: Optional[Union[str, List[str]]] = None
 
     room: Optional[str] = None
     description: Optional[str] = None
     prerequisites: Optional[List[str]] = None
+
+    # ✅ NEW: semester (array of objects)
+    semester: Optional[List[SemesterItem]] = None
+
+    # ✅ syllabus
+    syllabus: Optional[List[SyllabusItem]] = None
 
 
 class CourseUpdate(BaseModel):
@@ -36,21 +57,11 @@ class CourseUpdate(BaseModel):
     description: Optional[str] = None
     prerequisites: Optional[List[str]] = None
 
-class CourseDetailsResponse(BaseModel):
-    course_code: str
-    title: str
-    instructor: Optional[str] = None
-    credits: float
-    # Helper handles both string or list, but response will be list ideally or match frontend
-    # Frontend Types.ts says: string[] | string
-    schedule: Union[List[str], str] = []
-    room: Optional[str] = None
-    description: Optional[str] = None
-    syllabus: List[Dict[str, Any]] = []
-    prerequisites: List[str] = []
-    type: Optional[str] = None
-    department: Optional[str] = None
+    # ✅ NEW: semester (array of objects)
+    semester: Optional[List[SemesterItem]] = None
 
+    # ✅ syllabus
+    syllabus: Optional[List[SyllabusItem]] = None
 
 @router.get("/courses/{course_code}", response_model=CourseDetailsResponse)
 async def get_course_details(course_code: str, _admin=Depends(require_admin)):
@@ -65,119 +76,25 @@ async def get_course_details(course_code: str, _admin=Depends(require_admin)):
     return course
 
 @router.get("/courses")
-async def list_courses(_admin=Depends(require_admin)):
-    db = await get_database()
-    courses = await db["Courses"].find({}).to_list(length=2000)
-
-    # Safe conversion (even if _id is already a string like "c_01")
-    for c in courses:
-        if "_id" in c:
-            c["_id"] = str(c["_id"])
-
-    return courses
+async def api_list_courses(_admin=Depends(require_admin)):
+    return await list_courses()
 
 
 @router.get("/courses/{course_code}")
-async def get_course(course_code: str, _admin=Depends(require_admin)):
-    db = await get_database()
-
-    course = await db["Courses"].find_one({"course_code": course_code})
-    if not course:
-        raise HTTPException(status_code=404, detail="Course not found")
-
-    if "_id" in course:
-        course["_id"] = str(course["_id"])
-
-    return course
+async def api_get_course(course_code: str, _admin=Depends(require_admin)):
+    return await get_course(course_code)
 
 
 @router.post("/courses")
-async def create_course(payload: CourseCreate, _admin: Any = Depends(require_admin)):
-    db = await get_database()
-
-    # prevent duplicates by course_code
-    existing = await db["Courses"].find_one({"course_code": payload.course_code})
-    if existing:
-        raise HTTPException(status_code=400, detail="Course already exists")
-
-    doc = payload.model_dump(exclude_none=True)
-
-    # ✅ schema: _id must be string
-    doc["_id"] = f"c_{payload.course_code}"
-
-    # ✅ schema: credits must be double
-    doc["credits"] = float(payload.credits)
-
-    # ✅ IMPORTANT: Mongo validator expects schedule ARRAY (your current DB validator)
-    if "schedule" not in doc or doc["schedule"] is None:
-        doc["schedule"] = []
-    elif isinstance(doc["schedule"], str):
-        doc["schedule"] = [doc["schedule"]]
-    elif isinstance(doc["schedule"], list):
-        doc["schedule"] = doc["schedule"]
-
-    # optional but safe: keep prerequisites as array (or empty)
-    if "prerequisites" not in doc or doc["prerequisites"] is None:
-        doc["prerequisites"] = []
-    elif not isinstance(doc["prerequisites"], list):
-        doc["prerequisites"] = [str(doc["prerequisites"])]
-
-    try:
-        await db["Courses"].insert_one(doc)
-    except WriteError as e:
-        # turns Mongo validation error into a clean 400 instead of 500
-        raise HTTPException(status_code=400, detail=str(e))
-
-    return {"message": "Course created successfully", "_id": doc["_id"]}
-
-@router.delete("/courses/{course_code}")
-async def delete_course(course_code: str, _admin: Any = Depends(require_admin)):
-    db = await get_database()
-
-    result = await db["Courses"].delete_one({"course_code": course_code})
-
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Course not found")
-
-    return {"message": "Course deleted successfully"}
+async def api_create_course(payload: CourseCreate, _admin: Any = Depends(require_admin)):
+    return await create_course(payload.model_dump(exclude_none=True))
 
 
 @router.put("/courses/{course_code}")
-async def update_course(course_code: str, payload: CourseUpdate, _admin: Any = Depends(require_admin)):
-    db = await get_database()
+async def api_update_course(course_code: str, payload: CourseUpdate, _admin: Any = Depends(require_admin)):
+    return await update_course(course_code, payload.model_dump(exclude_none=True))
 
-    existing = await db["Courses"].find_one({"course_code": course_code})
-    if not existing:
-        raise HTTPException(status_code=404, detail="Course not found")
 
-    update = payload.model_dump(exclude_none=True)
-
-    # credits must be double
-    if "credits" in update:
-        update["credits"] = float(update["credits"])
-
-    # Mongo validator expects schedule ARRAY
-    if "schedule" in update:
-        if update["schedule"] is None:
-            update["schedule"] = []
-        elif isinstance(update["schedule"], str):
-            update["schedule"] = [update["schedule"]]
-        elif isinstance(update["schedule"], list):
-            update["schedule"] = update["schedule"]
-
-    # prerequisites should be array
-    if "prerequisites" in update:
-        if update["prerequisites"] is None:
-            update["prerequisites"] = []
-        elif not isinstance(update["prerequisites"], list):
-            update["prerequisites"] = [str(update["prerequisites"])]
-
-    if not update:
-        return {"message": "No changes"}
-
-    try:
-        await db["Courses"].update_one({"course_code": course_code}, {"$set": update})
-    except WriteError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    return {"message": "Course updated successfully"}
+@router.delete("/courses/{course_code}")
+async def api_delete_course(course_code: str, _admin: Any = Depends(require_admin)):
+    return await delete_course(course_code)
