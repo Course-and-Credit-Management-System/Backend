@@ -178,7 +178,10 @@ async def get_current_courses(current_user: Dict[str, Any] = Depends(get_current
     suitable_courses = await Course.find(
         {"semester.semester": current_year_str}
     ).to_list()
-
+    
+    # DEBUG: Check what user current year is used to match
+    print(f"DEBUG CURRENT: User Year={current_year_str}, Suitable Count={len(suitable_courses)}")
+    
     # 1.5 Find Retake Courses (Failed courses from previous matching semesters)
     # Logic: Status="Failed" AND Same Term Parity (Odd/Odd or Even/Even)
     # Changed to use Enrollments collection instead of academic_history embedded field
@@ -316,6 +319,84 @@ def get_course_color(course_type: str) -> str:
     if "elective" in ct: return "green"
     return "gray"
 
+def time_to_minutes(t_str: str) -> int:
+    try:
+        t_str = t_str.strip()
+        if ':' in t_str:
+            h, m = map(int, t_str.split(':'))
+            return h * 60 + m
+    except:
+        pass
+    return 0
+
+def parse_schedule_slots(schedule: Optional[List[str]]):
+    slots = []
+    if not schedule: return slots
+    
+    # Try different formats
+    # Format 1: "Mon/Wed 10:00 - 11:30"
+    # Format 2: "Monday 10:00-11:30"
+    
+    for s in schedule:
+        if not s: continue
+        s_clean = s.replace(" - ", "-").strip()
+        
+        # Split by spaces, trying to find the time part at the end
+        parts = s_clean.split(" ")
+        
+        # Look for time range pattern like HH:MM-HH:MM
+        time_part = None
+        days_part = None
+        
+        # Iterate backwards to find time
+        for i in range(len(parts) - 1, -1, -1):
+            p = parts[i]
+            if '-' in p and ':' in p:
+                time_part = p
+                # The rest before this is days
+                days_part = " ".join(parts[:i])
+                break
+        
+        if time_part and days_part:
+            try:
+                start_str, end_str = time_part.split('-')
+                start_min = time_to_minutes(start_str)
+                end_min = time_to_minutes(end_str)
+                
+                # Normalize days
+                # Handle "Mon/Wed", "Mon, Wed", "Monday"
+                # Simple normalization to 3 chars
+                
+                d_tokens = days_part.replace(',', ' ').replace('/', ' ').split()
+                for d in d_tokens:
+                    d = d.strip()
+                    if d:
+                        # normalize to first 3 chars title case if possible (Mon, Tue)
+                        # This ensures "Monday" matches "Mon"
+                        d_norm = d[:3].capitalize()
+                        slots.append((d_norm, start_min, end_min))
+            except:
+                print(f"DEBUG: Failed to parse schedule item: {s}")
+                pass
+        else:
+             # Fallback to my previous logic if spaces are messy "Mon 10:00 - 11:30"
+             # My previous logic relied on -2, -1.
+             # Let's try to extract time times using simple scan
+             pass
+             
+    return slots
+
+def has_schedule_conflict(slots1, slots2) -> bool:
+    count = 0
+    for d1, s1, e1 in slots1:
+        for d2, s2, e2 in slots2:
+            # Check day match (normalized)
+            if d1 == d2:
+                # Overlap logic: Start1 < End2 AND Start2 < End1
+                if s1 < e2 and s2 < e1:
+                    return True
+    return False
+
 @router.get("", response_model=CourseSearchResponse)
 async def search_courses(
     sort: Optional[str] = None,
@@ -343,8 +424,8 @@ async def search_courses(
         user_parity = "Second"
     
     user_version = "Unknown"
-    if "(new)" in norm_user_year: user_version = "new"
-    elif "(old)" in norm_user_year: user_version = "old"
+    if "(new)" in norm_user_year or "new ." in norm_user_year: user_version = "new"
+    elif "(old)" in norm_user_year or "old ." in norm_user_year: user_version = "old"
 
     # Identify passed courses
     passed_statuses = ["Passed", "Completed", "A+", "A", "A-", "B+", "B", "B-", "C+", "C", "D"]
@@ -363,6 +444,27 @@ async def search_courses(
     if all_prereq_codes:
         found_prereqs = await Course.find(In(Course.course_code, list(all_prereq_codes))).to_list()
         prereq_titles = {p.course_code: p.title for p in found_prereqs}
+
+    # 4. active enrollments for schedule conflict check
+    active_enrollments = await Enrollment.find(
+        Enrollment.student_id == current_user.get("user_id"),
+        In(Enrollment.status, [EnrollmentStatus.ENROLLED, EnrollmentStatus.PENDING]),
+        Enrollment.semester_attend == user_current_year_str
+    ).to_list()
+    
+    active_course_ids = {e.course_id for e in active_enrollments}
+    course_map = {c.course_code: c for c in courses}
+    
+    busy_slots = []
+    print(f"DEBUG_SCHED: Active courses: {list(active_course_ids)}")
+    
+    for cid in active_course_ids:
+        if cid in course_map:
+            c_obj = course_map[cid]
+            if c_obj.schedule:
+                parsed = parse_schedule_slots(c_obj.schedule)
+                print(f"DEBUG_SCHED: Course {cid} schedule '{c_obj.schedule}' -> {parsed}")
+                busy_slots.extend(parsed)
 
     response_data = []
 
@@ -393,8 +495,8 @@ async def search_courses(
                 elif "second sem" in norm_sem or "secondsem" in norm_sem or "2nd sem" in norm_sem: c_parity = "Second"
                 
                 c_version = "Unknown"
-                if "(new)" in norm_sem: c_version = "new"
-                elif "(old)" in norm_sem: c_version = "old"
+                if "(new)" in norm_sem or "new ." in norm_sem: c_version = "new"
+                elif "(old)" in norm_sem or "old ." in norm_sem: c_version = "old"
                 
                 # Check Parity Match
                 if c_parity == user_parity:
@@ -430,6 +532,14 @@ async def search_courses(
             if req not in passed_courses:
                 missing_prereqs.append(prereq_titles.get(req, req))
         
+        # Check Schedule Conflict
+        is_conflict = False
+        if course.course_code not in active_course_ids:
+            c_slots = parse_schedule_slots(course.schedule)
+            if has_schedule_conflict(c_slots, busy_slots):
+                # print(f"DEBUG_SCHED: Conflict detected for {course.course_code}. Slots: {c_slots} vs Busy: {busy_slots}")
+                is_conflict = True
+        
         error_msg = None
         status_str = "normal"
         
@@ -439,6 +549,8 @@ async def search_courses(
         elif missing_prereqs:
             status_str = "locked"
             error_msg = f"Missing Prerequisite: {', '.join(missing_prereqs)}"
+        elif is_conflict:
+             status_str = "locked"
         
         # C. Check if Retake
         already_taken = course.course_code in {h["course_code"] for h in academic_history}
@@ -455,6 +567,8 @@ async def search_courses(
              message_str = "this course is already been taken"
         elif not valid_context:
              message_str = context_message
+        elif is_conflict:
+             message_str = "schedule conflicted"
 
         # Enrollable Logic
         # 1. Must be Normal status (unlocked context, prerequisites met)

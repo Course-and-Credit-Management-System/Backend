@@ -121,6 +121,15 @@ Tracks a student's relationship with a course for a specific term.
 | `sender_id` | String | Admin ID |
 | `receiver_id` | String | Student ID |
 
+### Alerts Collection
+Simple notifications for students.
+| Field | Type | Constraints |
+| :--- | :--- | :--- |
+| `student_id` | String | Target Student ID |
+| `message` | String | Notification content |
+| `is_read` | Boolean | Read status |
+| `created_at` | Date | Creation time |
+
 ---
 
 ## Reference Dictionaries
