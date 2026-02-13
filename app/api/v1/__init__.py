@@ -13,6 +13,7 @@ from app.api.v1.endpoints.student import courses_router as student_courses_route
 from app.api.v1.endpoints.student import academic_router as student_academic_router
 from app.api.v1.endpoints.student.progress_simple import router as student_progress_router
 from app.api.v1.endpoints.student.alerts import router as student_alerts_router
+from app.api.v1.endpoints.ai.chatbot import router as ai_chat_router
 
 
 api_router = APIRouter()
@@ -35,3 +36,6 @@ api_router.include_router(student_courses_router)
 api_router.include_router(student_alerts_router)
 api_router.include_router(student_academic_router, prefix="/student", tags=["student"])
 api_router.include_router(student_progress_router, prefix="/student", tags=["student"])
+
+# AI / Chatbot
+api_router.include_router(ai_chat_router, prefix="/ai", tags=["ai"])

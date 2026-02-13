@@ -55,6 +55,31 @@ class Settings(BaseSettings):
     FROM_EMAIL: str 
     FRONTEND_URL: str
 
+    # --- AI / Mistral RAG ---
+    # Mistral API key used for both chat completions and embeddings.
+    # Configure in your environment or .env file as: MISTRAL_API_KEY=...
+    MISTRAL_API_KEY: str | None 
+
+    # Base URL for the Mistral HTTP API.
+    # Default is the public SaaS endpoint; override only if needed.
+    MISTRAL_API_BASE: str = "https://api.mistral.ai"
+
+    # Default chat model used for the chatbot endpoint.
+    # Example: "mistral-small-latest", "mistral-large-latest".
+    MISTRAL_MODEL: str = "mistral-small-latest"
+
+    # Embedding model and expected dimensions for Atlas Vector Search.
+    # When using Mistral embeddings, a common choice is "mistral-embed".
+    # EMBEDDING_DIMENSIONS must match your Atlas vector index configuration.
+    EMBEDDING_MODEL: str = "mistral-embed"
+    EMBEDDING_DIMENSIONS: int | None = None
+    EMBEDDING_BATCH_SIZE: int = 16
+    MISTRAL_MAX_RETRIES: int = 4
+    MISTRAL_RETRY_BASE_SECONDS: float = 1.0
+    MISTRAL_RETRY_MAX_SECONDS: float = 20.0
+    KNOWLEDGE_BASE_COLLECTION: str = "KnowledgeBase"
+    KNOWLEDGE_VECTOR_INDEX_NAME: str = "knowledge_vector_index"
+
     class Config:
         env_file = ".env"
         case_sensitive = True
