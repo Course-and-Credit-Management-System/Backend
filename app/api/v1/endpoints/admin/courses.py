@@ -1,8 +1,9 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Any, Optional, List, Union
 
 from app.api.v1.deps.auth import require_admin
+from app.api.v1.endpoints.student.courses import CourseDetailsResponse
 from app.services.admin_courses_service import (
     list_courses,
     get_course,
