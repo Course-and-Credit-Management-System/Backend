@@ -25,6 +25,7 @@ class StudentProfile(BaseModel):
     major_id: str
     academic_status: AcademicStatus = AcademicStatus.ACTIVE
     total_credits: int = 0
+    section: Optional[str] = None  # A, B, C for years 1-3
     advisor_id: Optional[str] = None
     is_major_student: bool = False
     gpa: float = Field(default=0.0, ge=0, le=4.0)

@@ -9,6 +9,10 @@ from app.api.v1.endpoints.admin.announcements import router as admin_announcemen
 from app.api.v1.endpoints.admin.messages import router as admin_messages_router
 from app.api.v1.endpoints.student import courses_router as student_courses_router
 from app.api.v1.endpoints.student.academic import router as student_academic_router
+from app.api.v1.endpoints.admin.exam_results import router as admin_exam_results_router
+from app.api.v1.endpoints.admin.students import router as admin_students_router
+
+from app.api.v1.endpoints.student.exam_results import router as student_exam_results_router
 
 
 api_router = APIRouter()
@@ -27,4 +31,6 @@ api_router.include_router(admin_messages_router)
 # Student
 api_router.include_router(student_courses_router)
 api_router.include_router(student_academic_router, prefix="/student", tags=["student"])
+api_router.include_router(admin_exam_results_router, prefix="/admin", tags=["Admin Exam Results"])
+api_router.include_router(admin_students_router, prefix="/admin/students", tags=["Admin Students"])
 
