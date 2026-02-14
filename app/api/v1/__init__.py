@@ -13,6 +13,7 @@ from app.api.v1.endpoints.student import courses_router as student_courses_route
 from app.api.v1.endpoints.student.academic import router as student_academic_router
 from app.api.v1.endpoints.admin.exam_results import router as admin_exam_results_router
 from app.api.v1.endpoints.admin.students import router as admin_students_router
+from app.api.v1.endpoints.student.alerts import router as student_alerts_router
 
 from app.api.v1.endpoints.student.exam_results import router as student_exam_results_router
 
