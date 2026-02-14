@@ -38,5 +38,4 @@ api_router.include_router(student_courses_router)
 api_router.include_router(student_alerts_router)
 api_router.include_router(student_academic_router, prefix="/student", tags=["student"])
 api_router.include_router(admin_exam_results_router, prefix="/admin", tags=["Admin Exam Results"])
-api_router.include_router(admin_students_router, prefix="/admin/students", tags=["Admin Students"])
 
