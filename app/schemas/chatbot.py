@@ -10,9 +10,18 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
+    course_id: Optional[str] = None
     history: List[ChatMessage] = []
-    student_id: Optional[str] = None
-    user_id: Optional[str] = None
+    mode: Literal[
+        "auto",
+        "course_selection",
+        "course_stats",
+        "course_advisor",
+        "academic_progress",
+        "major_requirements",
+        "announcements",
+        "policy_general",
+    ] = "auto"
 
 
 class ChatSource(BaseModel):
@@ -24,4 +33,3 @@ class ChatSource(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     sources: List[ChatSource] = []
-

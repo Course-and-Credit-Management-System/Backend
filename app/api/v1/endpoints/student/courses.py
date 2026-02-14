@@ -5,10 +5,23 @@ from app.api.v1.deps.auth import get_current_user
 from app.models.user import User
 from app.models.course import Course, CourseType
 from app.models.enrollment import Enrollment, EnrollmentStatus
-from pydantic import BaseModel
+from app.services.ai_chat_service import (
+    ChatServiceError,
+    MissingAIConfigError,
+    RateLimitedAIError,
+    chat_with_student_model,
+)
+from pydantic import BaseModel, Field
+import json
+import re
 import uuid
+import time
 
 router = APIRouter(prefix="/student/courses", tags=["student-courses"])
+_DROP_AI_CACHE_TTL_SECONDS = 120
+_DROP_AI_COOLDOWN_SECONDS = 20
+_drop_ai_plan_cache: Dict[str, Dict[str, Any]] = {}
+_drop_ai_cooldown_until: Dict[str, float] = {}
 
 class CourseResponse(BaseModel):
     tag: str
@@ -75,6 +88,49 @@ class CourseDetailsResponse(BaseModel):
     prerequisites: List[str] = []
     type: Optional[str] = None
     department: Optional[str] = None
+
+
+class EnrollmentAssistanceRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=1000)
+
+
+class EnrollmentAssistanceItem(BaseModel):
+    code: str
+    title: str
+    type: str
+    credits: float
+    desc: Optional[str] = None
+    color: str
+    status: str
+    error: Optional[str] = None
+    is_retake: bool
+    schedule: Optional[str] = None
+    message: Optional[str] = None
+    enrollable: bool
+    reason: str
+
+
+class EnrollmentAssistanceResponse(BaseModel):
+    data: List[EnrollmentAssistanceItem]
+    meta: Dict[str, Any]
+
+
+class DropRecommendationItem(BaseModel):
+    code: str
+    title: str
+    type: str
+    credits: float
+    reason: str
+
+
+class DropRecommendationResponse(BaseModel):
+    exceeds_limit: bool
+    message: str
+    credit_limit: float
+    current_total_credits: float
+    credits_to_drop: float
+    elective: Optional[DropRecommendationItem] = None
+    others: List[DropRecommendationItem] = Field(default_factory=list)
 
 @router.get("/detail/{course_code}", response_model=CourseDetailsResponse)
 async def get_course_details(course_code: str, current_user: Dict[str, Any] = Depends(get_current_user)):
@@ -397,6 +453,140 @@ def has_schedule_conflict(slots1, slots2) -> bool:
                     return True
     return False
 
+
+def _extract_ai_recommendations(answer_text: str) -> List[Dict[str, str]]:
+    raw = (answer_text or "").strip()
+    if not raw:
+        return []
+
+    parsed: Any = None
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        match = re.search(r"\{[\s\S]*\}", raw)
+        if match:
+            try:
+                parsed = json.loads(match.group(0))
+            except Exception:
+                parsed = None
+
+    if not isinstance(parsed, dict):
+        return []
+
+    items = parsed.get("recommendations")
+    if not isinstance(items, list):
+        return []
+
+    normalized: List[Dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("code") or "").strip()
+        reason = str(item.get("reason") or "").strip()
+        if code and reason:
+            normalized.append({"code": code, "reason": reason[:120]})
+    return normalized
+
+
+def _extract_ai_drop_recommendation(answer_text: str) -> Dict[str, Any]:
+    raw = (answer_text or "").strip()
+    if not raw:
+        return {}
+
+    parsed: Any = None
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        match = re.search(r"\{[\s\S]*\}", raw)
+        if match:
+            try:
+                parsed = json.loads(match.group(0))
+            except Exception:
+                parsed = None
+
+    if not isinstance(parsed, dict):
+        return {}
+    return parsed
+
+
+def _is_elective_course(course: CourseResponse) -> bool:
+    return "elective" in str(course.tag or "").lower()
+
+
+def _is_retake_course(course: CourseResponse) -> bool:
+    if bool(course.is_retake):
+        return True
+    if "retake" in str(course.tag or "").lower():
+        return True
+    return str(course.title or "").strip().lower().startswith("[retake]")
+
+
+def _fallback_drop_plan(
+    current_courses: List[CourseResponse],
+    excess_credits: float,
+) -> Dict[str, Any]:
+    available_map = {c.code: c for c in current_courses}
+    droppable_courses = [c for c in current_courses if not _is_retake_course(c)]
+    elective_courses = [c for c in droppable_courses if _is_elective_course(c)]
+    non_elective_courses = [c for c in droppable_courses if not _is_elective_course(c)]
+
+    selected: List[DropRecommendationItem] = []
+
+    if len(elective_courses) > 1:
+        sorted_electives = sorted(elective_courses, key=lambda c: c.credits, reverse=True)
+        for e in sorted_electives[1:]:
+            selected.append(
+                DropRecommendationItem(
+                    code=e.code,
+                    title=e.title,
+                    type=e.tag,
+                    credits=e.credits,
+                    reason="Only one elective should remain this semester.",
+                )
+            )
+
+    dropped_credits = sum(item.credits for item in selected)
+    remaining_needed = max(0.0, excess_credits - dropped_credits)
+    if remaining_needed > 0:
+        for c in sorted(non_elective_courses, key=lambda x: x.credits, reverse=True):
+            selected.append(
+                DropRecommendationItem(
+                    code=c.code,
+                    title=c.title,
+                    type=c.tag,
+                    credits=c.credits,
+                    reason="Dropping this helps reduce your total credits quickly.",
+                )
+            )
+            remaining_needed = max(0.0, remaining_needed - c.credits)
+            if remaining_needed <= 0:
+                break
+
+    unique: Dict[str, DropRecommendationItem] = {}
+    for item in selected:
+        if item.code in available_map and item.code not in unique:
+            unique[item.code] = item
+
+    ordered = list(unique.values())
+    elective = next((x for x in ordered if _is_elective_course(available_map[x.code])), None)
+    others = [x for x in ordered if elective is None or x.code != elective.code]
+    return {"elective": elective, "others": others}
+
+
+def _build_drop_ai_cache_key(
+    student_id: str,
+    current_courses: List[CourseResponse],
+    total_credits: float,
+    credit_limit: float,
+) -> str:
+    signature_parts = [
+        f"{c.code}:{c.credits}:{int(bool(c.is_retake))}:{c.tag}"
+        for c in current_courses
+    ]
+    signature_parts.sort()
+    signature = "|".join(signature_parts)
+    return f"{student_id}:{total_credits}:{credit_limit}:{signature}"
+
 @router.get("", response_model=CourseSearchResponse)
 async def search_courses(
     sort: Optional[str] = None,
@@ -628,6 +818,364 @@ async def search_courses(
     return CourseSearchResponse(
         data=response_data,
         meta={"total_count": len(response_data), "page": 1}
+    )
+
+
+@router.post("/enrollment-assistance", response_model=EnrollmentAssistanceResponse)
+async def course_enrollment_assistance(
+    payload: EnrollmentAssistanceRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    role = (current_user.get("role") or "").lower()
+    if role != "student":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="student role required",
+        )
+
+    enrollable_result = await search_courses(sort="enrollable", current_user=current_user)
+    enrollable_items = enrollable_result.data
+    if not enrollable_items:
+        return EnrollmentAssistanceResponse(
+            data=[],
+            meta={"total_count": 0, "page": 1},
+        )
+
+    enrollable_map = {c.code: c for c in enrollable_items}
+
+    candidates_for_ai = [
+        {
+            "code": c.code,
+            "title": c.title,
+            "credits": c.credits,
+            "type": c.type,
+            "desc": c.desc,
+            "schedule": c.schedule,
+        }
+        for c in enrollable_items
+    ]
+
+    ai_prompt = (
+        "Recommend enrollable courses for this student.\n"
+        "Only choose from CANDIDATE_COURSES.\n"
+        "Prefer courses related to STUDENT_MESSAGE.\n"
+        "Return valid JSON only:\n"
+        '{"recommendations":[{"code":"COURSE_CODE","reason":"short reason"}]}\n'
+        "Rules:\n"
+        "- max 5 courses\n"
+        "- reason must be short (max 12 words)\n"
+        "- do not include courses outside CANDIDATE_COURSES\n\n"
+        f"STUDENT_MESSAGE: {payload.message}\n"
+        f"CANDIDATE_COURSES: {json.dumps(candidates_for_ai, ensure_ascii=False)}"
+    )
+
+    try:
+        ai_answer, _ = await chat_with_student_model(
+            question=ai_prompt,
+            current_user=current_user,
+            history=None,
+            mode="course_selection",
+        )
+    except MissingAIConfigError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        ) from exc
+    except RateLimitedAIError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=str(exc),
+        ) from exc
+    except ChatServiceError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unexpected error while generating course assistance.",
+        ) from exc
+
+    ai_recs = _extract_ai_recommendations(ai_answer)
+    seen_codes = set()
+    recommendations: List[EnrollmentAssistanceItem] = []
+
+    for rec in ai_recs:
+        code = rec["code"]
+        if code in seen_codes or code not in enrollable_map:
+            continue
+        course = enrollable_map[code]
+        recommendations.append(
+            EnrollmentAssistanceItem(
+                code=course.code,
+                title=course.title,
+                type=course.type,
+                credits=course.credits,
+                desc=course.desc,
+                color=course.color,
+                status=course.status,
+                error=course.error,
+                is_retake=course.is_retake,
+                schedule=course.schedule,
+                message=course.message,
+                enrollable=course.enrollable,
+                reason=rec["reason"],
+            )
+        )
+        seen_codes.add(code)
+        if len(recommendations) >= 5:
+            break
+
+    if not recommendations:
+        fallback_codes = [c.code for c in enrollable_items[:3]]
+        for code in fallback_codes:
+            course = enrollable_map[code]
+            recommendations.append(
+                EnrollmentAssistanceItem(
+                    code=course.code,
+                    title=course.title,
+                    type=course.type,
+                    credits=course.credits,
+                    desc=course.desc,
+                    color=course.color,
+                    status=course.status,
+                    error=course.error,
+                    is_retake=course.is_retake,
+                    schedule=course.schedule,
+                    message=course.message,
+                    enrollable=course.enrollable,
+                    reason="Fits your current enrollable course options.",
+                )
+            )
+
+    return EnrollmentAssistanceResponse(
+        data=recommendations,
+        meta={"total_count": len(recommendations), "page": 1},
+    )
+
+
+@router.get("/drop-recommendation", response_model=DropRecommendationResponse)
+async def course_drop_recommendation(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    role = (current_user.get("role") or "").lower()
+    if role != "student":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="student role required",
+        )
+
+    current_data = await get_current_courses(current_user=current_user)
+    current_courses = current_data.courses
+    total_credits = float(current_data.total_credits)
+    credit_limit = float(current_data.max_credits)
+    excess_credits = max(0.0, total_credits - credit_limit)
+
+    if excess_credits <= 0:
+        return DropRecommendationResponse(
+            exceeds_limit=False,
+            message="Your current enrollment is within the 18-credit limit.",
+            credit_limit=credit_limit,
+            current_total_credits=total_credits,
+            credits_to_drop=0.0,
+            elective=None,
+            others=[],
+        )
+
+    candidates = [
+        {
+            "code": c.code,
+            "title": c.title,
+            "type": c.tag,
+            "credits": c.credits,
+            "is_retake": c.is_retake,
+        }
+        for c in current_courses
+    ]
+    elective_codes = [c.code for c in current_courses if _is_elective_course(c)]
+    non_droppable_retake_codes = [c.code for c in current_courses if _is_retake_course(c)]
+
+    ai_prompt = (
+        "You are an academic trade-off assistant.\n"
+        "Student is over the semester credit limit and needs course drop recommendations.\n"
+        "Return VALID JSON only with this exact shape:\n"
+        '{"elective":{"code":"COURSE_CODE","reason":"short reason"},"others":[{"code":"COURSE_CODE","reason":"short reason"}]}\n'
+        "Rules:\n"
+        "- NEVER suggest dropping any retake course (is_retake=true).\n"
+        "- The student must keep at most ONE elective course.\n"
+        "- Minimize number of dropped courses.\n"
+        "- If removing one course is enough to be <= limit, do not suggest extra drops.\n"
+        "- Pick from CANDIDATES only.\n"
+        "- Keep each reason short (max 16 words).\n\n"
+        f"CREDIT_LIMIT: {credit_limit}\n"
+        f"CURRENT_TOTAL_CREDITS: {total_credits}\n"
+        f"EXCESS_CREDITS: {excess_credits}\n"
+        f"ELECTIVE_CODES: {json.dumps(elective_codes, ensure_ascii=False)}\n"
+        f"NON_DROPPABLE_RETAKE_CODES: {json.dumps(non_droppable_retake_codes, ensure_ascii=False)}\n"
+        f"CANDIDATES: {json.dumps(candidates, ensure_ascii=False)}"
+    )
+
+    ai_plan: Dict[str, Any] = {}
+    ai_unavailable_reason: Optional[str] = None
+
+    student_id = str(current_user.get("user_id") or "")
+    cache_key = _build_drop_ai_cache_key(
+        student_id=student_id,
+        current_courses=current_courses,
+        total_credits=total_credits,
+        credit_limit=credit_limit,
+    )
+    now_ts = time.time()
+    cached = _drop_ai_plan_cache.get(cache_key)
+    if cached and float(cached.get("expires_at", 0.0)) > now_ts:
+        cached_plan = cached.get("plan")
+        if isinstance(cached_plan, dict):
+            ai_plan = cached_plan
+
+    in_cooldown = float(_drop_ai_cooldown_until.get(student_id, 0.0)) > now_ts
+    if not ai_plan and in_cooldown:
+        ai_unavailable_reason = "AI temporary cooldown due to recent rate limiting."
+
+    if not ai_plan and not in_cooldown:
+        try:
+            ai_answer, _ = await chat_with_student_model(
+                question=ai_prompt,
+                current_user=current_user,
+                history=None,
+                # Use a non-RAG mode to avoid extra embedding/vector calls for this endpoint.
+                mode="academic_progress",
+            )
+            ai_plan = _extract_ai_drop_recommendation(ai_answer)
+            if not ai_plan:
+                ai_unavailable_reason = "AI returned an invalid or empty JSON recommendation."
+            else:
+                _drop_ai_plan_cache[cache_key] = {
+                    "expires_at": now_ts + _DROP_AI_CACHE_TTL_SECONDS,
+                    "plan": ai_plan,
+                }
+                _drop_ai_cooldown_until.pop(student_id, None)
+        except MissingAIConfigError as exc:
+            ai_unavailable_reason = str(exc)
+        except RateLimitedAIError as exc:
+            ai_unavailable_reason = str(exc)
+            _drop_ai_cooldown_until[student_id] = now_ts + _DROP_AI_COOLDOWN_SECONDS
+        except ChatServiceError as exc:
+            ai_unavailable_reason = str(exc)
+            _drop_ai_cooldown_until[student_id] = now_ts + _DROP_AI_COOLDOWN_SECONDS
+        except Exception as exc:
+            ai_unavailable_reason = f"Unexpected AI error: {str(exc)}"
+
+    course_map = {c.code: c for c in current_courses}
+    selected_items: List[DropRecommendationItem] = []
+
+    elective_obj = ai_plan.get("elective") if isinstance(ai_plan, dict) else None
+    if isinstance(elective_obj, dict):
+        code = str(elective_obj.get("code") or "").strip()
+        reason = str(elective_obj.get("reason") or "").strip()[:180]
+        course = course_map.get(code)
+        if course and reason and not _is_retake_course(course):
+            selected_items.append(
+                DropRecommendationItem(
+                    code=course.code,
+                    title=course.title,
+                    type=course.tag,
+                    credits=course.credits,
+                    reason=reason,
+                )
+            )
+
+    ai_others = ai_plan.get("others") if isinstance(ai_plan, dict) else []
+    if isinstance(ai_others, list):
+        for item in ai_others:
+            if not isinstance(item, dict):
+                continue
+            code = str(item.get("code") or "").strip()
+            reason = str(item.get("reason") or "").strip()[:180]
+            course = course_map.get(code)
+            if not course or not reason:
+                continue
+            if _is_retake_course(course):
+                continue
+            if any(existing.code == code for existing in selected_items):
+                continue
+            selected_items.append(
+                DropRecommendationItem(
+                    code=course.code,
+                    title=course.title,
+                    type=course.tag,
+                    credits=course.credits,
+                    reason=reason,
+                )
+            )
+
+    if not selected_items:
+        fallback_plan = _fallback_drop_plan(current_courses=current_courses, excess_credits=excess_credits)
+        fallback_elective: Optional[DropRecommendationItem] = fallback_plan["elective"]
+        fallback_others: List[DropRecommendationItem] = fallback_plan["others"]
+        selected_items = ([fallback_elective] if fallback_elective else []) + fallback_others
+
+    forced_elective_drops = max(0, len(elective_codes) - 1)
+    current_selected_codes = {x.code for x in selected_items}
+    if forced_elective_drops > 0:
+        elective_candidates = [course_map[c] for c in elective_codes if c in course_map and not _is_retake_course(course_map[c])]
+        keep_code = max(elective_candidates, key=lambda c: c.credits).code if elective_candidates else None
+        must_drop_electives = [c for c in elective_candidates if c.code != keep_code]
+        for c in must_drop_electives:
+            if c.code in current_selected_codes:
+                continue
+            selected_items.append(
+                DropRecommendationItem(
+                    code=c.code,
+                    title=c.title,
+                    type=c.tag,
+                    credits=c.credits,
+                    reason="Only one elective should remain this semester.",
+                )
+            )
+            current_selected_codes.add(c.code)
+
+    dropped_credits = sum(x.credits for x in selected_items)
+    remaining_needed = max(0.0, excess_credits - dropped_credits)
+    if remaining_needed > 0:
+        remaining_courses = [
+            c for c in current_courses
+            if c.code not in current_selected_codes and not _is_retake_course(c)
+        ]
+        remaining_courses.sort(key=lambda c: c.credits, reverse=True)
+        for c in remaining_courses:
+            selected_items.append(
+                DropRecommendationItem(
+                    code=c.code,
+                    title=c.title,
+                    type=c.tag,
+                    credits=c.credits,
+                    reason="Dropping this helps bring your credits under the limit.",
+                )
+            )
+            current_selected_codes.add(c.code)
+            remaining_needed = max(0.0, remaining_needed - c.credits)
+            if remaining_needed <= 0:
+                break
+
+    final_elective = next((x for x in selected_items if _is_elective_course(course_map[x.code])), None)
+    final_others = [x for x in selected_items if final_elective is None or x.code != final_elective.code]
+
+    response_message = "Recommended courses to drop to meet the 18-credit limit."
+    if ai_unavailable_reason:
+        response_message = (
+            "Recommended courses to drop to meet the 18-credit limit "
+            "(fallback generated because AI is temporarily unavailable)."
+        )
+
+    return DropRecommendationResponse(
+        exceeds_limit=True,
+        message=response_message,
+        credit_limit=credit_limit,
+        current_total_credits=total_credits,
+        credits_to_drop=excess_credits,
+        elective=final_elective,
+        others=final_others,
     )
 
 @router.post("/enrollment", response_model=EnrollmentResponse)

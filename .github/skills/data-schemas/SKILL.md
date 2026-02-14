@@ -106,12 +106,59 @@ Tracks a student's relationship with a course for a specific term.
 ## 4. Communication
 
 ### Announcements Collection
-| Field | Type | Constraints |
-| :--- | :--- | :--- |
-| `type` | Enum | `'General'`, `'Urgent'`, `'Event'`, `'Academic'` |
-| `target_audience` | Enum | `'All'`, `'Students'`, `'Faculty'`, `'Computer Science Dept'`, `'Seniors'` |
-| `expiry_date` | Date | Nullable. If null, never expires. |
-| `posted_by` | String | Admin ID |
+`$jsonSchema` definition:
+
+```javascript
+{
+  $jsonSchema: {
+    bsonType: "object",
+    required: [
+      "_id",
+      "title",
+      "content",
+      "posted_by",
+      "date_posted",
+      "target_audience"
+    ],
+    properties: {
+      _id: {
+        bsonType: "string"
+      },
+      title: {
+        bsonType: "string"
+      },
+      content: {
+        bsonType: "string"
+      },
+      type: {
+        bsonType: "string",
+        enum: [
+          "General",
+          "Urgent",
+          "Event",
+          "Academic"
+        ],
+        description: "Determines visual styling and notification priority"
+      },
+      posted_by: {
+        bsonType: "string",
+        description: "Admin ID who created it"
+      },
+      date_posted: {
+        bsonType: "date"
+      },
+      expiry_date: {
+        bsonType: ["date", "null"],
+        description: "Optional date; set to null if the announcement does not expire"
+      },
+      target_audience: {
+        bsonType: "string",
+        description: "Filters who sees this announcement (free text allowed)"
+      }
+    }
+  }
+}
+```
 
 ### Messages Collection
 | Field | Type | Constraints |

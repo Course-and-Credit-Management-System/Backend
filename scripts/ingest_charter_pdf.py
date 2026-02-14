@@ -1,31 +1,31 @@
 """
-One-off script to ingest the UCS Sittway Charter PDF into the RAG KnowledgeBase.
+Ingest documents into the RAG KnowledgeBase with quality-oriented chunking.
+
+Supported inputs:
+  - Single file: .pdf, .docx, .txt, .md
+  - Directory: recursively ingests supported files
 
 Usage (from Backend/ directory):
 
-    pip install -r requirements.txt
-    # Ensure MONGODB_URL, MONGODB_DB_NAME, MISTRAL_API_KEY, EMBEDDING_MODEL are set in .env
-
     python -m scripts.ingest_charter_pdf
-    # or provide a custom path:
-    python -m scripts.ingest_charter_pdf "C:\\Users\\USER\\Downloads\\4-CS-7313-Object Oriented Database.pdf"
-
-This will:
-  1. Read the PDF.
-  2. Split it into reasonably sized text chunks.
-  3. Call Mistral embeddings to generate vectors.
-  4. Insert documents into the `KnowledgeBase` collection for Atlas Vector Search.
+    python -m scripts.ingest_charter_pdf "C:\\path\\to\\file.docx"
+    python -m scripts.ingest_charter_pdf "C:\\path\\to\\docs_folder" --chunk-size 1000 --overlap 150
 """
 
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
+import zipfile
+from argparse import ArgumentParser
 from pathlib import Path
-from typing import List
+from typing import Iterable, List
+from xml.etree import ElementTree as ET
 
 from pypdf import PdfReader
 
+from app.core.config import settings
 from app.core.database import get_database
 from app.services.ai_chat_service import embed_texts
 
@@ -41,95 +41,212 @@ def extract_text_from_pdf(pdf_path: Path) -> str:
     return "\n\n".join(texts)
 
 
-def chunk_text(text: str, max_chars: int = 1500) -> List[str]:
-    """
-    Naive text chunker based on character count.
+def extract_text_from_docx(docx_path: Path) -> str:
+    """Extract plain text from .docx using stdlib zip/xml."""
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    with zipfile.ZipFile(docx_path) as zf:
+        xml = zf.read("word/document.xml")
+    root = ET.fromstring(xml)
+    paragraphs: List[str] = []
+    for p in root.findall(".//w:p", ns):
+        parts = [t.text or "" for t in p.findall(".//w:t", ns)]
+        line = "".join(parts).strip()
+        if line:
+            paragraphs.append(line)
+    return "\n\n".join(paragraphs)
 
-    For more advanced behavior you can later switch to sentence or paragraph-based
-    chunking, but this is sufficient to get started.
-    """
-    text = text.strip()
+
+def extract_text_from_plain(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="ignore")
+
+
+def read_document_text(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        return extract_text_from_pdf(path)
+    if suffix == ".docx":
+        return extract_text_from_docx(path)
+    if suffix in {".txt", ".md", ".docs"}:
+        return extract_text_from_plain(path)
+    raise ValueError(f"Unsupported file type: {path.suffix}")
+
+
+def normalize_text(text: str) -> str:
+    lines = [ln.rstrip() for ln in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    cleaned: List[str] = []
+    blank = 0
+    for ln in lines:
+        stripped = re.sub(r"[ \t]+", " ", ln).strip()
+        if not stripped:
+            blank += 1
+            if blank <= 1:
+                cleaned.append("")
+        else:
+            blank = 0
+            cleaned.append(stripped)
+    return "\n".join(cleaned).strip()
+
+
+def _split_long_paragraph(paragraph: str, max_chars: int) -> List[str]:
+    sentences = re.split(r"(?<=[.!?])\s+", paragraph)
+    sentences = [s.strip() for s in sentences if s.strip()]
+    if not sentences:
+        return []
+    parts: List[str] = []
+    cur = ""
+    for s in sentences:
+        if len(s) > max_chars:
+            words = s.split()
+            buf = ""
+            for w in words:
+                candidate = f"{buf} {w}".strip()
+                if len(candidate) <= max_chars:
+                    buf = candidate
+                else:
+                    if buf:
+                        parts.append(buf)
+                    buf = w
+            if buf:
+                if cur:
+                    parts.append(cur)
+                    cur = ""
+                parts.append(buf)
+            continue
+
+        candidate = f"{cur} {s}".strip()
+        if not cur or len(candidate) <= max_chars:
+            cur = candidate
+        else:
+            parts.append(cur)
+            cur = s
+    if cur:
+        parts.append(cur)
+    return parts
+
+
+def _tail_for_overlap(text: str, overlap_chars: int) -> str:
+    if overlap_chars <= 0 or not text:
+        return ""
+    tail = text[-overlap_chars:]
+    if " " in tail:
+        tail = tail[tail.find(" ") + 1 :]
+    return tail.strip()
+
+
+def chunk_text_semantic(text: str, max_chars: int = 1000, overlap_chars: int = 150) -> List[str]:
+    """Chunk by paragraphs/sentences with overlap for better retrieval continuity."""
+    text = normalize_text(text)
     if not text:
         return []
 
-    chunks: List[str] = []
-    start = 0
-    length = len(text)
-
-    while start < length:
-        end = min(start + max_chars, length)
-
-        # Try to break on a sentence boundary or whitespace if possible.
-        split_at = text.rfind(". ", start, end)
-        if split_at == -1:
-            split_at = text.rfind("\n", start, end)
-        if split_at == -1:
-            split_at = text.rfind(" ", start, end)
-
-        if split_at == -1 or split_at <= start + max_chars * 0.5:
-            split_at = end
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    units: List[str] = []
+    for p in paragraphs:
+        if len(p) <= max_chars:
+            units.append(p)
         else:
-            split_at += 1  # include the period or space
+            units.extend(_split_long_paragraph(p, max_chars=max_chars))
 
-        chunk = text[start:split_at].strip()
-        if chunk:
-            chunks.append(chunk)
-        start = split_at
+    base_chunks: List[str] = []
+    cur = ""
+    for u in units:
+        candidate = f"{cur}\n\n{u}".strip() if cur else u
+        if len(candidate) <= max_chars:
+            cur = candidate
+        else:
+            if cur:
+                base_chunks.append(cur.strip())
+            cur = u
+    if cur:
+        base_chunks.append(cur.strip())
 
+    if overlap_chars <= 0 or len(base_chunks) <= 1:
+        return base_chunks
+
+    chunks = [base_chunks[0]]
+    for i in range(1, len(base_chunks)):
+        overlap = _tail_for_overlap(base_chunks[i - 1], overlap_chars)
+        merged = f"{overlap}\n\n{base_chunks[i]}".strip() if overlap else base_chunks[i]
+        chunks.append(merged)
     return chunks
 
 
-async def main(pdf_path: Path) -> None:
-    if not pdf_path.exists():
-        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+def resolve_input_files(input_path: Path) -> List[Path]:
+    supported = {".pdf", ".docx", ".txt", ".md", ".docs"}
+    if input_path.is_file():
+        return [input_path]
+    if input_path.is_dir():
+        return sorted([p for p in input_path.rglob("*") if p.is_file() and p.suffix.lower() in supported])
+    raise FileNotFoundError(f"Path not found: {input_path}")
 
-    print(f"[ingest] Reading PDF from: {pdf_path}")
-    full_text = extract_text_from_pdf(pdf_path)
-    if not full_text.strip():
-        raise RuntimeError("No text extracted from PDF; check the file contents.")
 
-    print("[ingest] Chunking text...")
-    chunks = chunk_text(full_text, max_chars=1500)
-    print(f"[ingest] Created {len(chunks)} chunks.")
+def parse_args(argv: Iterable[str]) -> tuple[Path, int, int]:
+    parser = ArgumentParser(description="Ingest documents into KnowledgeBase for RAG.")
+    parser.add_argument("path", nargs="?", default=r"C:\Users\USER\Downloads")
+    parser.add_argument("--chunk-size", type=int, default=1000)
+    parser.add_argument("--overlap", type=int, default=150)
+    args = parser.parse_args(list(argv))
+    return Path(args.path), max(300, args.chunk_size), max(0, args.overlap)
 
-    print("[ingest] Generating embeddings via Mistral...")
-    embeddings = await embed_texts(chunks)
-    if len(embeddings) != len(chunks):
-        raise RuntimeError(
-            f"Embeddings length mismatch: {len(embeddings)} vs chunks {len(chunks)}"
-        )
 
-    db = await get_database()
-    collection = db["KnowledgeBase"]
+async def main(input_path: Path, chunk_size: int, overlap: int) -> None:
+    files = resolve_input_files(input_path)
+    if not files:
+        raise RuntimeError("No supported files found (.pdf, .docx, .txt, .md, .docs).")
 
-    docs = []
-    for chunk, emb in zip(chunks, embeddings):
-        docs.append(
-            {
-                "text": chunk,
-                "embedding": emb,
-                "metadata": {
-                    "source": pdf_path.name,
-                    "path": str(pdf_path),
-                    "type": "docs",
-                    "hasCode": False,
-                },
-            }
-        )
+    print(f"[ingest] Found {len(files)} file(s).")
+    all_docs: List[dict] = []
 
-    if not docs:
-        print("[ingest] No documents to insert.")
+    for file_path in files:
+        print(f"[ingest] Reading: {file_path}")
+        full_text = read_document_text(file_path)
+        full_text = normalize_text(full_text)
+        if not full_text:
+            print(f"[ingest] Skipping empty text: {file_path.name}")
+            continue
+
+        chunks = chunk_text_semantic(full_text, max_chars=chunk_size, overlap_chars=overlap)
+        if not chunks:
+            print(f"[ingest] No chunks generated: {file_path.name}")
+            continue
+
+        print(f"[ingest] {file_path.name}: {len(chunks)} chunks")
+        embeddings = await embed_texts(chunks, task_type="RETRIEVAL_DOCUMENT")
+        if len(embeddings) != len(chunks):
+            raise RuntimeError(f"Embeddings mismatch for {file_path.name}: {len(embeddings)} vs {len(chunks)}")
+
+        for idx, (chunk, emb) in enumerate(zip(chunks, embeddings)):
+            all_docs.append(
+                {
+                    "text": chunk,
+                    "embedding": emb,
+                    "metadata": {
+                        "source": file_path.name,
+                        "path": str(file_path),
+                        "type": "docs",
+                        "format": file_path.suffix.lower().lstrip("."),
+                        "hasCode": "```" in chunk or re.search(r"\b(class|def|function|SELECT|INSERT)\b", chunk) is not None,
+                        "chunk_index": idx,
+                        "chunk_total": len(chunks),
+                        "chunk_chars": len(chunk),
+                        "embedding_provider": "gemini",
+                        "embedding_model": settings.GEMINI_EMBEDDING_MODEL,
+                        "embedding_dimensions": settings.EMBEDDING_DIMENSIONS,
+                    },
+                }
+            )
+
+    if not all_docs:
+        print("[ingest] Nothing to insert.")
         return
 
-    print(f"[ingest] Inserting {len(docs)} documents into KnowledgeBase...")
-    await collection.insert_many(docs)
-    print("[ingest] Done. KnowledgeBase is now populated for this PDF.")
+    db = await get_database()
+    collection = db[settings.KNOWLEDGE_BASE_COLLECTION]
+    print(f"[ingest] Inserting {len(all_docs)} chunks into {settings.KNOWLEDGE_BASE_COLLECTION}...")
+    await collection.insert_many(all_docs)
+    print("[ingest] Done.")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        pdf = Path(sys.argv[1])
-    else:
-        pdf = Path(r"C:\Users\USER\Downloads\UCS_Sittway_Charter_Fifth_Draft.pdf")
-    asyncio.run(main(pdf))
-
+    input_path, chunk_size, overlap = parse_args(sys.argv[1:])
+    asyncio.run(main(input_path, chunk_size, overlap))
