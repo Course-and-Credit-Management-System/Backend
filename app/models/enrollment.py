@@ -51,6 +51,7 @@ class Enrollment(Document):
     grade: Optional[Grade] = Field(default=None)
     points: Optional[float] = Field(default=None)
     scores: Optional[float] = Field(default=None)
+    reason: Optional[str] = Field(default=None, description="Reason for status change (e.g. admin note)")
 
     class Settings:
         name = "Enrollments"

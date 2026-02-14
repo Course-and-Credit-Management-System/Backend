@@ -2,13 +2,12 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from jose import jwt
+from pydantic import BaseModel, EmailStr
 
 from app.core.config import settings
 from app.core.database import get_database
 from app.core.security import hash_password, verify_password
 from app.api.v1.deps.auth import get_current_user
-from pydantic import BaseModel, EmailStr
-from passlib.hash import bcrypt
 
 from app.core.email import send_reset_email
 from app.core.reset_tokens import generate_reset_token, hash_token, get_expiry_time
@@ -16,13 +15,7 @@ from app.core.reset_tokens import generate_reset_token, hash_token, get_expiry_t
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
-async def _get_col(db, names: list[str]):
-    cols = await db.list_collection_names()
-    for n in names:
-        if n in cols:
-            return db[n]
-    # default to first name
-    return db[names[0]]
+
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr
 
@@ -32,14 +25,20 @@ class ResetPasswordWithTokenRequest(BaseModel):
     new_password: str
 
 
+async def _get_col(db, names: list[str]):
+    cols = await db.list_collection_names()
+    for n in names:
+        if n in cols:
+            return db[n]
+    return db[names[0]]
+
+
 def _cookie_params():
     """
     Centralize cookie settings.
     - Local dev (HTTP): secure=False, samesite="lax"
     - Production (HTTPS): secure=True, samesite="none" (if frontend+backend different domains)
     """
-    # For most local demos (same IP, different ports), Lax works.
-    # If you deploy with frontend+backend on different domains, use SameSite=None + Secure=True.
     return dict(
         key=settings.COOKIE_NAME,
         httponly=True,
@@ -47,7 +46,6 @@ def _cookie_params():
         samesite=settings.COOKIE_SAMESITE,
         max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         path="/",
-        # domain=settings.COOKIE_DOMAIN,  # only if you add it in config (usually not needed)
     )
 
 
@@ -67,14 +65,7 @@ async def login(payload: dict, response: Response):
     users = await _get_col(db, ["Users", "users"])
     creds = await _get_col(db, ["AuthCredentials", "authcredentials"])
 
-    user = await users.find_one(
-        {
-            "$and": [
-                {"$or": [{"user_id": username}, {"email": username}]},
-                {"role": {"$regex": f"^{role}$", "$options": "i"}},
-            ]
-        }
-    )
+    user = await users.find_one({"$or": [{"user_id": username}, {"email": username}], "role": role})
     if not user:
         # Try finding without role to see if it's a role mismatch
         user_check = await users.find_one({"$or": [{"user_id": username}, {"email": username}]})
@@ -84,24 +75,35 @@ async def login(payload: dict, response: Response):
              print("LOGIN DEBUG: User NOT found in 'Users' collection")
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    print(f"LOGIN DEBUG: User found: {user.get('_id')}")
-    cred = await creds.find_one({"user_id": user["user_id"]})
+    user_id = user["user_id"]
+    cred = await creds.find_one({"user_id": user_id})
 
-    # First-time bootstrap: create credentials with DEFAULT_PASSWORD
+    # ✅ First-time bootstrap: create credentials ONCE without overwriting existing
     if not cred:
         if len(settings.DEFAULT_PASSWORD.encode("utf-8")) > 72:
             raise HTTPException(status_code=500, detail="DEFAULT_PASSWORD too long (bcrypt max 72 bytes)")
 
         default_hash = hash_password(settings.DEFAULT_PASSWORD)
 
-        cred = {
-            "user_id": user["user_id"],
-            "password_hash": default_hash,
-            "must_reset_password": True,
-            "created_at": datetime.now(timezone.utc),
-            "updated_at": datetime.now(timezone.utc),
-        }
-        await creds.insert_one(cred)
+        await creds.update_one(
+            {"user_id": user_id},
+            {
+                "$setOnInsert": {
+                    "user_id": user_id,
+                    "password_hash": default_hash,
+                    "must_reset_password": True,
+                    "created_at": datetime.now(timezone.utc),
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+            upsert=True,
+        )
+
+        cred = await creds.find_one({"user_id": user_id})
+
+    if not cred:
+        # Extremely defensive: should never happen
+        raise HTTPException(status_code=500, detail="Auth credential bootstrap failed")
 
     if not verify_password(password, cred["password_hash"]):
         print(f"LOGIN DEBUG: Password verification failed for user {username}")
@@ -110,10 +112,9 @@ async def login(payload: dict, response: Response):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     expire = datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    token_payload = {"sub": user["user_id"], "role": user["role"], "exp": expire}
+    token_payload = {"sub": user_id, "role": user["role"], "exp": expire}
     access_token = jwt.encode(token_payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
-    # ✅ Set HttpOnly cookie (this is the REALISTIC method)
     response.set_cookie(
         **_cookie_params(),
         value=access_token,
@@ -166,11 +167,13 @@ async def reset_password(payload: dict, current_user=Depends(get_current_user)):
 
     await creds.update_one(
         {"user_id": current_user["user_id"]},
-        {"$set": {
-            "password_hash": new_hash,
-            "must_reset_password": False,
-            "updated_at": datetime.now(timezone.utc)
-        }},
+        {
+            "$set": {
+                "password_hash": new_hash,
+                "must_reset_password": False,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
     )
 
     return {"message": "Password updated successfully"}
@@ -212,7 +215,6 @@ async def forgot_password(payload: ForgotPasswordRequest, db=Depends(get_databas
     try:
         send_reset_email(to_email=email, reset_token=raw_token)
     except Exception:
-        # Don't leak details
         return {"message": "If the account exists, we sent an email."}
 
     return {"message": "If the account exists, we sent an email."}
@@ -231,7 +233,6 @@ async def reset_password_with_token(payload: ResetPasswordWithTokenRequest, db=D
 
     token_hash = hash_token(token)
 
-    # ✅ Lookup token in ResetTokens
     reset_doc = await db["ResetTokens"].find_one({"token_hash": token_hash})
     if not reset_doc:
         raise HTTPException(status_code=400, detail="Invalid or expired reset token.")
@@ -245,13 +246,11 @@ async def reset_password_with_token(payload: ResetPasswordWithTokenRequest, db=D
 
     user_id = reset_doc["user_id"]
 
-    # ✅ Ensure user has credentials row
     creds = db["AuthCredentials"]
     cred = await creds.find_one({"user_id": user_id})
     if not cred:
         raise HTTPException(status_code=400, detail="No credentials found for this user.")
 
-    # ✅ Hash & update password
     new_hash = hash_password(new_password)
 
     await creds.update_one(
@@ -265,7 +264,6 @@ async def reset_password_with_token(payload: ResetPasswordWithTokenRequest, db=D
         },
     )
 
-    # ✅ Mark token used
     await db["ResetTokens"].update_one(
         {"_id": reset_doc["_id"]},
         {"$set": {"used": True, "used_at": datetime.utcnow()}},

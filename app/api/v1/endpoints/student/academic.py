@@ -16,9 +16,45 @@ from app.api.v1.deps.auth import get_current_user
 
 router = APIRouter()
 
+def format_period_display(academic_year: str, semester: str) -> str:
+    """Format period display name for PDF certificates"""
+    # Convert "1st Year, First Sem(new)" to "First Year, First Semester"
+    if "1st Year" in academic_year and "First Sem" in semester:
+        return "First Year, First Semester"
+    elif "1st Year" in academic_year and "Second Sem" in semester:
+        return "First Year, Second Semester"
+    elif "2nd Year" in academic_year and "First Sem" in semester:
+        return "Second Year, First Semester"
+    elif "2nd Year" in academic_year and "Second Sem" in semester:
+        return "Second Year, Second Semester"
+    elif "3rd Year" in academic_year and "First Sem" in semester:
+        return "Third Year, First Semester"
+    elif "3rd Year" in academic_year and "Second Sem" in semester:
+        return "Third Year, Second Semester"
+    elif "4th Year" in academic_year and "First Sem" in semester:
+        return "Fourth Year, First Semester"
+    elif "4th Year" in academic_year and "Second Sem" in semester:
+        return "Fourth Year, Second Semester"
+    # Fallback to original format if no pattern matches
+    return f"{academic_year} ({semester})"
+
+async def _get_col(db, names: list[str]):
+    cols = await db.list_collection_names()
+    for n in names:
+        if n in cols:
+            return db[n]
+    return db[names[0]]
+
 def _map_student_record(data: dict) -> schemas.CompleteAcademicRecord:
     profile = data.get("student_profile") or {}
+    
+    # Handle both processed data and raw academic_history
     semesters_in = data.get("academic_history") or []
+    
+    # If academic_history is empty but user has raw academic_history, use that
+    if not semesters_in and "academic_history" in data:
+        semesters_in = data["academic_history"]
+    
     semesters_map = {}
     for entry in semesters_in:
         sem = entry.get("semester") or ""
@@ -29,31 +65,46 @@ def _map_student_record(data: dict) -> schemas.CompleteAcademicRecord:
     for sem_name, entries in semesters_map.items():
         results_out: List[schemas.StudentResult] = []
         for r in entries:
-            # Use static credit unit of 3 for all courses
-            credits = 3
+            # Credits should only count for completed/passed courses
+            status_val = (r.get("status") or "").strip()
+            credits = r.get("credits", 3) or 3
+            countable_statuses = {"Completed", "Passed"}
             grade_val = r.get("grade") or ""
-            gp = calculate_course_points(grade_val, 1) if grade_val else 0.0
-            gpe = calculate_course_points(grade_val, credits) if grade_val else 0.0
+            gp = calculate_course_points(grade_val, 1) if (grade_val and status_val in countable_statuses) else 0.0
+            gpe = calculate_course_points(grade_val, credits) if (grade_val and status_val in countable_statuses) else 0.0
             results_out.append(
                 schemas.StudentResult(
                     course_code=r.get("course_code") or r.get("code") or "",
                     course_title=r.get("course_title") or r.get("title"),
                     grade=grade_val,
                     points=gp,
-                    status=r.get("status") or "Completed",
+                    status=status_val or "Unknown",
                     result_tag=get_result_tag(r.get("grade") or ""),
                     review_status=r.get("review_status") or "None",
                     lecture_hours=2,
                     tda_hours=2,
-                    credit_unit=credits,
+                    credit_unit=credits if status_val in countable_statuses else 0,
                     grade_points_earned=gpe,
                 )
             )
         sem_credits = sum(res.credit_unit or 0 for res in results_out)
         sem_points = sum(res.grade_points_earned or 0 for res in results_out)
         sem_gpa = calculate_gpa(sem_points, sem_credits)
-        academic_year = sem_name.split(" (")[0] if " (" in sem_name else sem_name
-        semester_plain = sem_name.split(" (")[1].replace(")", "") if " (" in sem_name else sem_name
+        
+        # Parse Semester Name
+        if " . " in sem_name and len(sem_name.split(" . ")) >= 3:
+            # Format: "New . 1st Year . First Sem"
+            parts = sem_name.split(" . ")
+            # parts[0]=New/Old, parts[1]=Year, parts[2]=Sem
+            academic_year = f"{parts[1]} ({parts[0]})"
+            semester_plain = parts[2]
+        elif " (" in sem_name:
+            academic_year = sem_name.split(" (")[0]
+            semester_plain = sem_name.split(" (")[1].replace(")", "") 
+        else:
+            academic_year = sem_name
+            semester_plain = sem_name
+
         semesters_out.append(
             schemas.SemesterResult(
                 academic_year=academic_year,
@@ -84,19 +135,61 @@ def _map_student_record(data: dict) -> schemas.CompleteAcademicRecord:
 
 async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas.CompleteAcademicRecord:
     db = await get_database()
-    users = db["Users"]
-    doc = None
-
+    users = await _get_col(db, ["Users", "users"])
+    enrollments = await _get_col(db, ["Enrollments", "enrollments"])
+    courses = await _get_col(db, ["Courses", "courses"])
+    
+    # Get user info
+    user_doc = None
     if user_id:
-        doc = await users.find_one({"user_id": user_id})
-        if not doc and ObjectId.is_valid(user_id):
-            doc = await users.find_one({"_id": ObjectId(user_id)})
+        user_doc = await users.find_one({"user_id": user_id})
+        if not user_doc and ObjectId.is_valid(user_id):
+            user_doc = await users.find_one({"_id": ObjectId(user_id)})
 
-    if not doc:
+    if not user_doc:
         return get_mock_academic_record()
     
+    # Get student's enrollments (support multiple possible field names)
+    enroll_query = {
+        "$or": [
+            {"student_id": user_id},
+            {"student_user_id": user_id},
+            {"user_id": user_id},
+        ]
+    }
+    enrollment_records = await enrollments.find(enroll_query).to_list(None)
+    
+    if not enrollment_records:
+        return get_mock_academic_record()
+    
+    # Build academic history from enrollments
+    academic_history = []
+    for enrollment in enrollment_records:
+        # Resolve course doc robustly by _id or course_code
+        course_id_or_code = enrollment.get("course_id", "") or enrollment.get("course_code", "")
+        course = None
+        if course_id_or_code:
+            course = await courses.find_one({"_id": course_id_or_code})
+            if not course:
+                course = await courses.find_one({"course_code": course_id_or_code})
+        
+        academic_history.append({
+            "course_code": (course or {}).get("course_code", course_id_or_code),
+            "course_title": (course or {}).get("title", course_id_or_code),
+            "grade": enrollment.get("grade", ""),
+            "status": enrollment.get("status", "Unknown"),
+            "semester": enrollment.get("semesterAttend", ""),
+            "credits": (course or {}).get("credits", enrollment.get("credits", 3)),
+            "points": enrollment.get("points", 0),
+            "is_retake": enrollment.get("is_retake", False)
+        })
+    
+    # Create a combined document for mapping
+    combined_doc = dict(user_doc)
+    combined_doc["academic_history"] = academic_history
+    
     # Ensure we pass a dict (Motor returns a dict)
-    return _map_student_record(doc)
+    return _map_student_record(combined_doc)
 
 # Mock Data for Multiple Semesters
 def get_mock_academic_record():
@@ -243,27 +336,61 @@ async def get_academic_status():
 
 # 7. Student - Courses & Results
 
-@router.get("/courses/current", response_model=List[schemas.CourseSchedule])
-async def get_current_courses():
+@router.get("/courses/current", response_model=schemas.CourseSchedule)
+async def get_current_courses(current_user=Depends(get_current_user)):
     """
     Returns the current semester's schedule and credits.
     """
-    return [
-        {
-            "course_code": "CST-1010",
-            "title": "Intro to Data Science",
-            "credits": 3.0,
-            "schedule": ["Mon 10:00-11:30", "Wed 10:00-11:30"],
-            "room": "Bldg A, 302"
-        },
-        {
-            "course_code": "CST-2020",
-            "title": "Database Systems",
-            "credits": 3.0,
-            "schedule": ["Tue 13:00-14:30", "Thu 13:00-14:30"],
-            "room": "Bldg B, 101"
+    db = await get_database()
+    enrollments = await _get_col(db, ["Enrollments", "enrollments"])
+    courses = await _get_col(db, ["Courses", "courses"])
+    
+    user_id = current_user.get("user_id")
+    
+    # Get current enrollments for the student (support multiple possible field names)
+    enroll_query = {
+        "$or": [
+            {"student_id": user_id},
+            {"student_user_id": user_id},
+            {"user_id": user_id},
+        ]
+    }
+    enrollment_records = await enrollments.find(enroll_query).to_list(None)
+    
+    current_courses = []
+    total_credits = 0
+    
+    for enrollment in enrollment_records:
+        # Get course details
+        course_id_or_code = enrollment.get("course_id", "") or enrollment.get("course_code", "")
+        course = None
+        if course_id_or_code:
+            # Try by _id first (many datasets store string IDs like "c_004")
+            course = await courses.find_one({"_id": course_id_or_code})
+            # Fallback: some datasets store course_id as course_code (e.g., "CS-101")
+            if not course:
+                course = await courses.find_one({"course_code": course_id_or_code})
+        
+        course_data = {
+            "code": (course or {}).get("course_code", course_id_or_code),
+            "title": (course or {}).get("title", course_id_or_code),
+            "credits": (course or {}).get("credits", enrollment.get("credits", 3)),
+            "instructor": (course or {}).get("instructor", "TBA"),
+            "location": (course or {}).get("room", "TBA"),
+            "is_retake": enrollment.get("is_retake", False),
+            "tag": "Core",
         }
-    ]
+        current_courses.append(course_data)
+        total_credits += course_data["credits"]
+    
+    # Return the structure expected by frontend
+    return {
+        "semester_name": "Current Semester",
+        "total_credits": total_credits,
+        "max_credits": 18,
+        "courses_count": len(current_courses),
+        "courses": current_courses
+    }
 
 @router.get("/results", response_model=schemas.CompleteAcademicRecord)
 async def get_student_results(user_id: Optional[str] = None, current_user=Depends(get_current_user)):
@@ -316,7 +443,7 @@ async def download_certificate_pdf(
         
         certificate_data = schemas.CertificateData(
             student=academic_record.student,
-            period=f"{target_semester.academic_year} ({target_semester.semester})",
+            period=format_period_display(target_semester.academic_year, target_semester.semester),
             semester_result=target_semester
         )
         pdf_buffer = generate_certificate_pdf(certificate_data)
@@ -326,14 +453,28 @@ async def download_certificate_pdf(
         return StreamingResponse(pdf_buffer, media_type="application/pdf", headers=headers)
     
     if (type or "").lower() == "year" and academic_year:
-        year_semesters = [sem for sem in academic_record.academic_summary.semesters if sem.academic_year == academic_year]
+        # Handle year-level matching (e.g., "Second Year" should match "2nd Year, First Sem" and "2nd Year, Second Sem")
+        year_semesters = []
+        for sem in academic_record.academic_summary.semesters:
+            sem_academic_year = sem.academic_year
+            if (academic_year == "First Year" and ("1st Year" in sem_academic_year or "First Year" in sem_academic_year)) or \
+               (academic_year == "Second Year" and ("2nd Year" in sem_academic_year or "Second Year" in sem_academic_year)) or \
+               (academic_year == "Third Year" and ("3rd Year" in sem_academic_year or "Third Year" in sem_academic_year)) or \
+               (academic_year == "Fourth Year" and ("4th Year" in sem_academic_year or "Fourth Year" in sem_academic_year)):
+                year_semesters.append(sem)
+        
+        # Fallback to exact match if no year-level matches found
+        if not year_semesters:
+            year_semesters = [sem for sem in academic_record.academic_summary.semesters if sem.academic_year == academic_year]
+        
         if not year_semesters:
             raise HTTPException(status_code=404, detail=f"No semesters found for academic year {academic_year}")
+        
         summary = calculate_academic_summary(year_semesters)
         year_record = schemas.CompleteAcademicRecord(student=academic_record.student, academic_summary=summary)
         pdf_buffer = generate_complete_transcript_pdf(year_record)
         headers = {
-            'Content-Disposition': f'attachment; filename="grading_certificate_{academic_year}.pdf"'
+            'Content-Disposition': f'attachment; filename="grading_certificate_{academic_year.replace(' ', '_')}.pdf"'
         }
         return StreamingResponse(pdf_buffer, media_type="application/pdf", headers=headers)
     
@@ -478,4 +619,120 @@ async def get_enrollment_alerts():
     return {
         "warnings": ["Max credit limit reached (18/18)"],
         "retakes": ["CST-1005 (Failed last semester)"]
+    }
+
+@router.get("/progress")
+async def get_degree_progress(current_user=Depends(get_current_user)):
+    """
+    Calculate student's degree progress percentage.
+    
+    Returns:
+    - Total courses (Core + Elective) from Courses collection
+    - Completed courses (from Enrollment with status="Passed" or user's academic_history)
+    - Progress percentage for each category
+    - Overall progress
+    """
+    print("PROGRESS DEBUG: Endpoint called!")
+    
+    if current_user.get("role") != "student":
+        raise HTTPException(status_code=403, detail="Student access required")
+    
+    student_id = current_user.get("user_id")
+    print(f"PROGRESS DEBUG: Student ID: {student_id}")
+    print(f"PROGRESS DEBUG: User has academic_history: {bool(current_user.get('academic_history'))}")
+    if current_user.get('academic_history'):
+        print(f"PROGRESS DEBUG: Academic history length: {len(current_user.get('academic_history', []))}")
+    
+    db = await get_database()
+    
+    # Get collections
+    courses_col = await _get_col(db, ["Courses", "courses"])
+    enrollment_col = await _get_col(db, ["Enrollment", "enrollment"])
+    
+    # Get all courses and categorize them
+    all_courses = []
+    async for course in courses_col.find({}):
+        all_courses.append(course)
+    
+    # Separate core and elective courses
+    core_courses = [c for c in all_courses if c.get("type", "").lower() == "core"]
+    elective_courses = [c for c in all_courses if c.get("type", "").lower() == "elective"]
+    
+    # Get student's passed courses from enrollment
+    passed_enrollments = []
+    async for enrollment in enrollment_col.find({
+        "student_id": student_id,
+        "status": "Passed"
+    }):
+        passed_enrollments.append(enrollment)
+    
+    # If no enrollments found, use academic_history from user data
+    if not passed_enrollments and current_user.get("academic_history"):
+        academic_history = current_user.get("academic_history", [])
+        # Convert academic_history entries to enrollment-like format
+        for course_entry in academic_history:
+            if course_entry.get("status") in ["Completed", "Passed"]:
+                passed_enrollments.append({
+                    "course_id": course_entry.get("course_id"),
+                    "course_code": course_entry.get("course_code"),
+                    "status": course_entry.get("status"),
+                    "grade": course_entry.get("grade"),
+                    "credits": course_entry.get("credits")
+                })
+    
+    # Get passed course IDs (try both course_id and course_code)
+    passed_course_ids = []
+    for enrollment in passed_enrollments:
+        course_id = enrollment.get("course_id") or enrollment.get("course_code")
+        if course_id:
+            passed_course_ids.append(course_id)
+    
+    # Count completed courses by type
+    completed_core = 0
+    completed_elective = 0
+    
+    for course_id in passed_course_ids:
+        # Find the course to determine its type
+        # Try multiple matching strategies
+        course = None
+        for c in all_courses:
+            if (c.get("course_code") == course_id or 
+                c.get("_id") == course_id or
+                c.get("course_code") == course_id):
+                course = c
+                break
+        
+        if course:
+            if course.get("type", "").lower() == "core":
+                completed_core += 1
+            elif course.get("type", "").lower() == "elective":
+                completed_elective += 1
+    
+    # Calculate percentages
+    total_core = len(core_courses)
+    total_elective = len(elective_courses)
+    total_courses = total_core + total_elective
+    
+    core_percentage = (completed_core / total_core * 100) if total_core > 0 else 0
+    elective_percentage = (completed_elective / total_elective * 100) if total_elective > 0 else 0
+    overall_percentage = ((completed_core + completed_elective) / total_courses * 100) if total_courses > 0 else 0
+    
+    return {
+        "student_id": student_id,
+        "total_courses": {
+            "core": total_core,
+            "elective": total_elective,
+            "overall": total_courses
+        },
+        "completed_courses": {
+            "core": completed_core,
+            "elective": completed_elective,
+            "overall": completed_core + completed_elective
+        },
+        "progress_percentage": {
+            "core": round(core_percentage, 2),
+            "elective": round(elective_percentage, 2),
+            "overall": round(overall_percentage, 2)
+        },
+        "passed_course_details": passed_enrollments
     }

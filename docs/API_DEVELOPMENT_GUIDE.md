@@ -13,22 +13,30 @@ If you use default Beanie behavior (snake_case), queries will return empty resul
 
 ## 1. Database Persistence (Beanie & MongoDB)
 
-### **Handling Custom String IDs**
-By default, Beanie expects MongoDB `_id` fields to be `ObjectId`. Since our legacy data or seeded data uses string IDs (e.g., `"c_101"`, `"auth_01"`), we **must** explicitly define the `id` field in every `Document` model.
+### **Handling Custom String IDs vs ObjectId**
+*   **Custom String IDs**: Used in `User`, `Course` (legacy/seeded data).
+    *   `id: Optional[str] = Field(default=None, alias="_id")`
+*   **Auto-generated ObjectIds**: Used in `Alerts`, new `Enrollments`.
+    *   `id: Optional[PydanticObjectId] = Field(default=None, alias="_id")`
+    *   **CRITICAL**: Do NOT use `Optional[str]` for ObjectId collections. It causes Pydantic Validation Errors on inserts.
 
-**❌ Incorrect (Will fail validation):**
+### **Partial Updates (Avoid `.save()`)**
+When modifying a single field (e.g., Status), **ALWAYS** use atomic update operators (`$set`) instead of `doc.save()`.
+
+**❌ Incorrect (.save()):**
 ```python
-class Course(Document):
-    # Beanie assumes _id is PydanticObjectId
-    course_code: str
+doc.status = "New"
+# Overwrites ENTIRE document. If 'grade' is None in Python, it writes 'null' to DB.
+# Triggers Schema Validation Error 121 if 'null' is forbidden.
+await doc.save()
 ```
 
-**✅ Correct:**
+**✅ Correct (Atomic Update):**
 ```python
-class Course(Document):
-    # Tell Beanie _id is a string
-    id: Optional[str] = Field(default=None, alias="_id")
-    course_code: str
+# Only touches the 'status' field.
+await doc.update({"$set": {"status": "New"}})
+# Update local object reference if needed for subsequent logic
+doc.status = "New"
 ```
 
 ### **Collection Names**
@@ -136,3 +144,60 @@ await Enrollment.find(...).update({"$set": {"status": EnrollmentStatus.DROPPED}}
 # And filter out DROPPED records in your GET /dashboard endpoints.
 ```
 *   **Result:** The "tombstone" record persists. The Auto-Enroll logic sees the record exists (so it doesn't re-enroll), but the UI hides it because of the status filter.
+
+
+## 9. Course Enrollment & Business Rules
+
+### **Filters & Sorting**
+- **Filtering**: Server-side string searching (`q`) is removed; search is handled by frontend.
+- **Sorting**: `sort="enrollable"` is a strict filter.
+  - **Action**: Returns ONLY courses where `enrollable: true`.
+  - **Ordering**: Alphabetical by `code`.
+
+### **Validation Rules (Parity & Version)**
+To determine if a user can enroll (Status: "normal"):
+1.  **Parity Match**: 
+    -   If User Profile is "First Sem" -> Can only enroll in "First Sem" (matches "1st Sem" etc) courses.
+    -   If User Profile is "Second Sem" -> Can only enroll in "Second Sem" (matches "2nd Sem" etc) courses.
+    -   *Message if Closed*: `"this course has been closed"`.
+2.  **Version Match**:
+    -   If User Profile is "(new)" -> Course must match "(new)" or be version-agnostic.
+    -   If User Profile is "(old)" -> Course must match "(old)" or be version-agnostic.
+    -   *Message if Mismatch*: `"this course is for old student"` or `"this course is for new student"`.
+
+### **"Already Taken" vs "Failed"**
+A course is considered **"Already Taken"** if it exists in the user's Global Academic History (regardless of status).
+
+**Enrollable Boolean Calculations (`enrollable`):**
+| Status in History | `enrollable` | Message |
+| :--- | :--- | :--- |
+| **Passed / Completed** | `false` | `"this course is already been taken"` |
+| **Failed / F** | `true` | *None* (Retake allowed) |
+| **No Status** (Legacy) | `false` | `"this course is already been taken"` |
+| **Not in History** | `true` (if Valid Context) | *None* |
+
+### **Priority of Messages**
+1.  **"Already Taken"**: Always shown first if the course exists in history.
+2.  **"Closed / Version Mismatch"**: Shown if not taken, but context prevents enrollment.
+## 10. Data Enrichment & Joins
+MongoDB Join (`$lookup`) is complex to type with Beanie. Prefer **Application-Side Joins** for simple enrichments.
+
+**Pattern (List Enrollments + Names):**
+1.  Fetch efficient list of source docs (Enrollments).
+2.  Extract unique foreign keys (`student_ids`, `course_ids`).
+3.  Bulk fetch related docs using `In` operator: `User.find(In(User.user_id, student_ids))`.
+4.  Create HashMaps (`id -> data`).
+5.  Map data to response model in Python loop.
+
+## 11. Alerts & Notifications Logic
+*   **Separation of Concerns**: Do not bloat transactional collections (Enrollment) with transient data (Reasons/Messages).
+*   **Alerts Collection**: Store notifications here.
+*   **Logic**:
+    *   Update Enrollment Status (Atomic).
+    *   Create Alert Document (Insert).
+    *   Return Alert Message in API Response.
+
+## 12. Handling MongoDB Schema Validation
+If you encounter `Document failed validation (121)`:
+1.  **Strict Partial Updates**: Use `update({"$set": {...}})` instead of `save()`. `save()` writes the whole document, sending `null` for unset Optional fields, which strict schemas might reject.
+2.  **Schema Patching**: If fields must be nullable (like `grade`), rely on `scripts/fix_enrollment_validator.py` or similar maintenance scripts to adjust `$jsonSchema`.

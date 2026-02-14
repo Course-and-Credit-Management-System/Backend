@@ -169,16 +169,16 @@ def generate_certificate_pdf(data: CertificateData) -> BytesIO:
     
     # Signature
     sig_data = [
-        ["", "Nyon", ""],
-        ["", "(Nyo Mi Thar Saw)", ""],
-        ["Date: ........................", "Registrar(2)", ""],
-        ["", "University of Information Technology", ""]
+        ["Date: ........................", "", "Registrar"],
+        ["Receipt No: ..............", "", "University of"],
+        ["", "", "Information Technology Myanmar"]
     ]
-    sig_table = Table(sig_data, colWidths=[2.5*inch, 2.5*inch, 2.5*inch])
+    sig_table = Table(sig_data, colWidths=[2.5*inch, 1.0*inch, 2.0*inch])
     sig_table.setStyle(TableStyle([
-        ('ALIGN', (1,0), (1,-1), 'CENTER'),
-        ('FONTNAME', (1,0), (1,0), 'Times-Italic'),
-        ('FONTSIZE', (1,0), (1,0), 16),
+        ('ALIGN', (0,0), (0,-1), 'LEFT'),
+        ('ALIGN', (2,0), (2,-1), 'CENTER'),
+        ('FONTNAME', (0,0), (-1,-1), 'Helvetica'),
+        ('FONTSIZE', (0,0), (-1,-1), 10),
     ]))
     elements.append(sig_table)
 
@@ -350,16 +350,16 @@ def generate_complete_transcript_pdf(data: CompleteAcademicRecord) -> BytesIO:
     
     # Signature
     sig_data = [
-        ["", "Nyon", ""],
-        ["", "(Nyo Mi Thar Saw)", ""],
-        ["Date: ........................", "Registrar(2)", ""],
-        ["", "University of Information Technology", ""]
+        ["Date: ........................", "", "Registrar"],
+        ["Receipt No: ..............", "", "University of"],
+        ["", "", "Information Technology Myanmar"]
     ]
-    sig_table = Table(sig_data, colWidths=[2.5*inch, 2.5*inch, 2.5*inch])
+    sig_table = Table(sig_data, colWidths=[2.5*inch, 1.0*inch, 2.0*inch])
     sig_table.setStyle(TableStyle([
-        ('ALIGN', (1,0), (1,-1), 'CENTER'),
-        ('FONTNAME', (1,0), (1,0), 'Times-Italic'),
-        ('FONTSIZE', (1,0), (1,0), 16),
+        ('ALIGN', (0,0), (0,-1), 'LEFT'),
+        ('ALIGN', (2,0), (2,-1), 'CENTER'),
+        ('FONTNAME', (0,0), (-1,-1), 'Helvetica'),
+        ('FONTSIZE', (0,0), (-1,-1), 10),
     ]))
     elements.append(sig_table)
 
