@@ -94,7 +94,7 @@ Tracks a student's relationship with a course for a specific term.
 | :--- | :--- | :--- |
 | `student_id` | String | Ref to User |
 | `course_id` | String | Ref to Course |
-| `semesterAttend` | String | e.g., "First Year, First Sem(old)" |
+| `semesterAttend` | String | e.g., `"New . 1st Year . First Sem"` |
 | `is_retake` | Boolean | Flag for repeat attempts |
 | `status` | Enum | `'Enrolled'`, `'Pending'`, `'Conflict'`, `'Waitlisted'`, `'Completed'`, `'Dropped'`, `'Withdrawn'`, `'Failed'`, `'Passed'` |
 | `grade` | Enum | `'A+'`, `'A'`, `'A-'`, `'B+'`, `'B'`, `'B-'`, `'C+'`, `'C'`, `'D'`, `'F'`, `'W'`, `'I'`, `'U'`, `'Abs'` |
@@ -201,16 +201,17 @@ Simple notifications for students.
 
 ### Year & Semester Enum (Crucial)
 This specific format must be used for `current_year` and `semesterAttend`.
+Do not use legacy comma/parenthesis formats like `1st Year, First Sem(new)`.
 
 ```typescript
 type AcademicYear = 
-  | '1st Year, First Sem(new)' | '1st Year, Second Sem(new)'
-  | '2nd Year, First Sem(new)' | '2nd Year, Second Sem(new)'
-  | '3rd Year, First Sem(new)' | '3rd Year, Second Sem(new)'
-  | '4th Year, First Sem(new)' | '4th Year, Second Sem(new)'
-  | '1st Year, First Sem(old)' | '1st Year, Second Sem(old)'
-  | '2nd Year, First Sem(old)' | '2nd Year, Second Sem(old)'
-  | '3rd Year, First Sem(old)' | '3rd Year, Second Sem(old)'
-  | '4th Year, First Sem(old)' | '4th Year, Second Sem(old)'
-  | '5th Year, First Sem(old)' | '5th Year, Second Sem(old)';
+  | 'New . 1st Year . First Sem' | 'New . 1st Year . Second Sem'
+  | 'New . 2nd Year . First Sem' | 'New . 2nd Year . Second Sem'
+  | 'New . 3rd Year . First Sem' | 'New . 3rd Year . Second Sem'
+  | 'New . 4th Year . First Sem' | 'New . 4th Year . Second Sem'
+  | 'Old . 1st Year . First Sem' | 'Old . 1st Year . Second Sem'
+  | 'Old . 2nd Year . First Sem' | 'Old . 2nd Year . Second Sem'
+  | 'Old . 3rd Year . First Sem' | 'Old . 3rd Year . Second Sem'
+  | 'Old . 4th Year . First Sem' | 'Old . 4th Year . Second Sem'
+  | 'Old . 5th Year . First Sem' | 'Old . 5th Year . Second Sem';
 ```

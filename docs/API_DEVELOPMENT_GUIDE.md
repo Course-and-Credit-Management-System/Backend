@@ -108,6 +108,21 @@ If the API returns "Internal Server Error" without a clear valid traceback in th
 
 ## 7. Business Logic Implementation
 
+### **Canonical Academic Term String (Critical)**
+`current_year` and `semesterAttend` must use this exact format:
+
+```text
+New . 1st Year . First Sem
+```
+
+Valid families are:
+- `New . {1st|2nd|3rd|4th} Year . {First|Second} Sem`
+- `Old . {1st|2nd|3rd|4th|5th} Year . {First|Second} Sem`
+
+Do not write legacy variants such as:
+- `1st Year, First Sem(new)`
+- `1st Year, Second Sem(old)`
+
 ### **Data Structures inside Models**
 If a field structure is dynamic or mixed (like `semester` containing boolean flags alongside string values), avoid strict typing like `List[Dict[str, str]]`.
 Use `List[Dict[str, Any]]` instead to prevent `ValidationError` on read.
