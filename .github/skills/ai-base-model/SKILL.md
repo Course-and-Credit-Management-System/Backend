@@ -71,7 +71,6 @@ Keep one orchestration path and extend behavior through:
   - context keys present for new feature
 
 ## Anti-Patterns (Do Not)
-- Add request-only identity fields (`user_id`, `student_id`, `target_student_id`) for core routing.
 - Duplicate prompt orchestration in endpoint or separate service file.
 - Force RAG for intents requiring precise real-time DB facts.
 

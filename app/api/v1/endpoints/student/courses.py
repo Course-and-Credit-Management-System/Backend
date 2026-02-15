@@ -12,6 +12,7 @@ from app.services.ai_chat_service import (
     chat_with_student_model,
 )
 from pydantic import BaseModel, Field
+import asyncio
 import json
 import re
 import uuid
@@ -22,6 +23,7 @@ _DROP_AI_CACHE_TTL_SECONDS = 120
 _DROP_AI_COOLDOWN_SECONDS = 20
 _drop_ai_plan_cache: Dict[str, Dict[str, Any]] = {}
 _drop_ai_cooldown_until: Dict[str, float] = {}
+_drop_ai_locks: Dict[str, asyncio.Lock] = {}
 
 class CourseResponse(BaseModel):
     tag: str
@@ -587,6 +589,30 @@ def _build_drop_ai_cache_key(
     signature = "|".join(signature_parts)
     return f"{student_id}:{total_credits}:{credit_limit}:{signature}"
 
+
+def _get_drop_ai_lock(student_id: str) -> asyncio.Lock:
+    lock = _drop_ai_locks.get(student_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _drop_ai_locks[student_id] = lock
+    return lock
+
+
+def _prune_drop_ai_cache(now_ts: float) -> None:
+    expired_keys = [
+        key for key, value in _drop_ai_plan_cache.items()
+        if float(value.get("expires_at", 0.0)) <= now_ts
+    ]
+    for key in expired_keys:
+        _drop_ai_plan_cache.pop(key, None)
+
+
+def _cache_drop_ai_plan(cache_key: str, now_ts: float, plan: Dict[str, Any]) -> None:
+    _drop_ai_plan_cache[cache_key] = {
+        "expires_at": now_ts + _DROP_AI_CACHE_TTL_SECONDS,
+        "plan": plan,
+    }
+
 @router.get("", response_model=CourseSearchResponse)
 async def search_courses(
     sort: Optional[str] = None,
@@ -1027,6 +1053,7 @@ async def course_drop_recommendation(
         credit_limit=credit_limit,
     )
     now_ts = time.time()
+    _prune_drop_ai_cache(now_ts)
     cached = _drop_ai_plan_cache.get(cache_key)
     if cached and float(cached.get("expires_at", 0.0)) > now_ts:
         cached_plan = cached.get("plan")
@@ -1038,33 +1065,47 @@ async def course_drop_recommendation(
         ai_unavailable_reason = "AI temporary cooldown due to recent rate limiting."
 
     if not ai_plan and not in_cooldown:
-        try:
-            ai_answer, _ = await chat_with_student_model(
-                question=ai_prompt,
-                current_user=current_user,
-                history=None,
-                # Use a non-RAG mode to avoid extra embedding/vector calls for this endpoint.
-                mode="academic_progress",
-            )
-            ai_plan = _extract_ai_drop_recommendation(ai_answer)
-            if not ai_plan:
-                ai_unavailable_reason = "AI returned an invalid or empty JSON recommendation."
-            else:
-                _drop_ai_plan_cache[cache_key] = {
-                    "expires_at": now_ts + _DROP_AI_CACHE_TTL_SECONDS,
-                    "plan": ai_plan,
-                }
-                _drop_ai_cooldown_until.pop(student_id, None)
-        except MissingAIConfigError as exc:
-            ai_unavailable_reason = str(exc)
-        except RateLimitedAIError as exc:
-            ai_unavailable_reason = str(exc)
-            _drop_ai_cooldown_until[student_id] = now_ts + _DROP_AI_COOLDOWN_SECONDS
-        except ChatServiceError as exc:
-            ai_unavailable_reason = str(exc)
-            _drop_ai_cooldown_until[student_id] = now_ts + _DROP_AI_COOLDOWN_SECONDS
-        except Exception as exc:
-            ai_unavailable_reason = f"Unexpected AI error: {str(exc)}"
+        async with _get_drop_ai_lock(student_id):
+            now_ts = time.time()
+            _prune_drop_ai_cache(now_ts)
+            cached = _drop_ai_plan_cache.get(cache_key)
+            if cached and float(cached.get("expires_at", 0.0)) > now_ts:
+                cached_plan = cached.get("plan")
+                if isinstance(cached_plan, dict):
+                    ai_plan = cached_plan
+
+            in_cooldown = float(_drop_ai_cooldown_until.get(student_id, 0.0)) > now_ts
+            if not ai_plan and in_cooldown:
+                ai_unavailable_reason = "AI temporary cooldown due to recent rate limiting."
+
+            if not ai_plan and not in_cooldown:
+                try:
+                    ai_answer, _ = await chat_with_student_model(
+                        question=ai_prompt,
+                        current_user=current_user,
+                        history=None,
+                        # Use a non-RAG mode to avoid extra embedding/vector calls for this endpoint.
+                        mode="academic_progress",
+                    )
+                    ai_plan = _extract_ai_drop_recommendation(ai_answer)
+                    if not ai_plan:
+                        ai_unavailable_reason = "AI returned an invalid or empty JSON recommendation."
+                        _drop_ai_cooldown_until[student_id] = now_ts + _DROP_AI_COOLDOWN_SECONDS
+                    else:
+                        _cache_drop_ai_plan(cache_key=cache_key, now_ts=now_ts, plan=ai_plan)
+                        _drop_ai_cooldown_until.pop(student_id, None)
+                except MissingAIConfigError as exc:
+                    ai_unavailable_reason = str(exc)
+                    _drop_ai_cooldown_until[student_id] = now_ts + _DROP_AI_COOLDOWN_SECONDS
+                except RateLimitedAIError as exc:
+                    ai_unavailable_reason = str(exc)
+                    _drop_ai_cooldown_until[student_id] = now_ts + _DROP_AI_COOLDOWN_SECONDS
+                except ChatServiceError as exc:
+                    ai_unavailable_reason = str(exc)
+                    _drop_ai_cooldown_until[student_id] = now_ts + _DROP_AI_COOLDOWN_SECONDS
+                except Exception as exc:
+                    ai_unavailable_reason = f"Unexpected AI error: {str(exc)}"
+                    _drop_ai_cooldown_until[student_id] = now_ts + _DROP_AI_COOLDOWN_SECONDS
 
     course_map = {c.code: c for c in current_courses}
     selected_items: List[DropRecommendationItem] = []
@@ -1114,6 +1155,12 @@ async def course_drop_recommendation(
         fallback_elective: Optional[DropRecommendationItem] = fallback_plan["elective"]
         fallback_others: List[DropRecommendationItem] = fallback_plan["others"]
         selected_items = ([fallback_elective] if fallback_elective else []) + fallback_others
+        if ai_unavailable_reason:
+            fallback_cache_plan: Dict[str, Any] = {
+                "elective": fallback_elective.model_dump() if fallback_elective else None,
+                "others": [item.model_dump() for item in fallback_others],
+            }
+            _cache_drop_ai_plan(cache_key=cache_key, now_ts=now_ts, plan=fallback_cache_plan)
 
     forced_elective_drops = max(0, len(elective_codes) - 1)
     current_selected_codes = {x.code for x in selected_items}
