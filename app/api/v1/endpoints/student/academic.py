@@ -90,21 +90,8 @@ def _map_student_record(data: dict) -> schemas.CompleteAcademicRecord:
         sem_credits = sum(res.credit_unit or 0 for res in results_out)
         sem_points = sum(res.grade_points_earned or 0 for res in results_out)
         sem_gpa = calculate_gpa(sem_points, sem_credits)
-        
-        # Parse Semester Name
-        if " . " in sem_name and len(sem_name.split(" . ")) >= 3:
-            # Format: "New . 1st Year . First Sem"
-            parts = sem_name.split(" . ")
-            # parts[0]=New/Old, parts[1]=Year, parts[2]=Sem
-            academic_year = f"{parts[1]} ({parts[0]})"
-            semester_plain = parts[2]
-        elif " (" in sem_name:
-            academic_year = sem_name.split(" (")[0]
-            semester_plain = sem_name.split(" (")[1].replace(")", "") 
-        else:
-            academic_year = sem_name
-            semester_plain = sem_name
-
+        academic_year = sem_name.split(" (")[0] if " (" in sem_name else sem_name
+        semester_plain = sem_name.split(" (")[1].replace(")", "") if " (" in sem_name else sem_name
         semesters_out.append(
             schemas.SemesterResult(
                 academic_year=academic_year,
@@ -474,7 +461,7 @@ async def download_certificate_pdf(
         year_record = schemas.CompleteAcademicRecord(student=academic_record.student, academic_summary=summary)
         pdf_buffer = generate_complete_transcript_pdf(year_record)
         headers = {
-            'Content-Disposition': f'attachment; filename="grading_certificate_{academic_year.replace(' ', '_')}.pdf"'
+            'Content-Disposition': f'attachment; filename="grading_certificate_{academic_year.replace(" ", "_")}.pdf"'
         }
         return StreamingResponse(pdf_buffer, media_type="application/pdf", headers=headers)
     
