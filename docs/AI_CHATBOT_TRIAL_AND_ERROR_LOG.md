@@ -4,19 +4,29 @@
 Track what was tried, what worked, what failed, and why for AI chatbot development.  
 This prevents repeating the same mistakes and makes future tuning faster.
 
+## Is This Necessary?
+Yes, for this project it is necessary to keep this log because chatbot behavior depends on prompts, mode routing, context building, and provider reliability.
+
+Use this log when you change:
+- Chat routes or request/response schema
+- Mode classification or mode-specific behavior
+- Prompt/context assembly logic
+- Retrieval strategy, model settings, retry behavior, or rate-limit handling
+
 ## Current Architecture Snapshot
 - API routes:
   - `POST /api/v1/ai/ai/student/chat`
   - `POST /api/v1/ai/ai/admin/chat`
   - `POST /api/v1/ai/ai/chat` (compat route, dispatch by role)
+  - `POST /api/v1/ai/ai/student/course-chat` (forces `course_advisor` mode)
 - Core orchestration:
   - `app/services/ai_chat_service.py`
 - Structured context builders:
   - `app/services/ai_context_service.py`
 - Request shape:
-  - `message`, `history`, `mode`
+  - `message`, `history`, `mode`, `course_id` (optional except for course advisor route)
 - Mode values:
-  - `auto`, `course_selection`, `course_stats`, `academic_progress`, `major_requirements`, `announcements`, `policy_general`
+  - `auto`, `course_selection`, `course_stats`, `course_advisor`, `academic_progress`, `major_requirements`, `announcements`, `policy_general`
 
 ## Success Metrics (track every change)
 - Answer quality:
