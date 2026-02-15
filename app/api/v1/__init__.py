@@ -15,6 +15,7 @@ from app.api.v1.endpoints.admin.exam_results import router as admin_exam_results
 from app.api.v1.endpoints.student.alerts import router as student_alerts_router
 
 from app.api.v1.endpoints.student.exam_results import router as student_exam_results_router
+from app.api.v1.endpoints.ai.chatbot import router as ai_chat_router
 
 
 api_router = APIRouter()
@@ -38,3 +39,6 @@ api_router.include_router(student_alerts_router)
 api_router.include_router(student_academic_router, prefix="/student", tags=["student"])
 api_router.include_router(admin_exam_results_router, prefix="/admin", tags=["Admin Exam Results"])
 
+
+# AI / Chatbot
+api_router.include_router(ai_chat_router, prefix="/ai", tags=["ai"])

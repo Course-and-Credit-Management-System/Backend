@@ -35,17 +35,20 @@ async def create_enrollment(
     Manually enroll a student in a course.
     Automatically fetches the semester from the student's current_year.
     """
-    # 1. Validate Student
-    student = await User.find_one(User.user_id == payload.student_id)
+    # 1. Validate Student (raw read to tolerate legacy current_year values)
+    student = await User.get_motor_collection().find_one(
+        {"user_id": payload.student_id},
+        {"user_id": 1, "student_profile.current_year": 1},
+    )
     if not student:
         raise HTTPException(status_code=404, detail="Student not found")
 
     # 2. Determine Semester (Always from Student Profile)
-    if not student.student_profile or not student.student_profile.current_year:
-            raise HTTPException(status_code=400, detail="Student has no valid profile or current_year")
-    
-    # Ensure we get the value (Enum -> str)
-    semester_attend = str(student.student_profile.current_year.value) if hasattr(student.student_profile.current_year, 'value') else str(student.student_profile.current_year)
+    student_profile = student.get("student_profile") or {}
+    current_year = student_profile.get("current_year")
+    if not current_year:
+        raise HTTPException(status_code=400, detail="Student has no valid profile or current_year")
+    semester_attend = str(current_year)
 
     # 3. Validate Course
     course = await Course.find_one(Course.course_code == payload.course_id)
@@ -109,10 +112,19 @@ async def list_enrollments(
     student_ids = list({e.student_id for e in enrollments})
     course_ids = list({e.course_id for e in enrollments})
     
-    students = await User.find(In(User.user_id, student_ids)).to_list()
+    student_docs = await User.get_motor_collection().find(
+        {"user_id": {"$in": student_ids}},
+        {"user_id": 1, "name": 1, "avatar": 1},
+    ).to_list(length=None)
     courses = await Course.find(In(Course.course_code, course_ids)).to_list()
     
-    student_map = {s.user_id: {"name": s.name, "avatar": s.avatar} for s in students}
+    student_map = {
+        str(s.get("user_id")): {
+            "name": s.get("name"),
+            "avatar": s.get("avatar"),
+        }
+        for s in student_docs
+    }
     course_map = {c.course_code: c.title for c in courses}
     
     results = []
