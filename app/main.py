@@ -27,16 +27,24 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# ✅ IMPORTANT RULE:
-# If allow_credentials=True, allow_origins CANNOT be "*".
-# It must be a list of exact origins, e.g.:
-# "http://localhost:3000", "http://192.168.31.172:3000"
+# CORS: If allow_credentials=True, allow_origins cannot be "*"
+# Ensure both localhost and 127.0.0.1 are allowed (browser may use either)
+_cors_origins = settings.CORS_ORIGINS
+if isinstance(_cors_origins, str):
+    import json
+    try:
+        _cors_origins = json.loads(_cors_origins)
+    except json.JSONDecodeError:
+        _cors_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
+if not _cors_origins:
+    _cors_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 app.include_router(api_router, prefix="/api/v1")
