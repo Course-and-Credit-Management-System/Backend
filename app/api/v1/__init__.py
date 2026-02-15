@@ -12,7 +12,6 @@ from app.api.v1.endpoints.admin.students import router as admin_students_router
 from app.api.v1.endpoints.student import courses_router as student_courses_router
 from app.api.v1.endpoints.student.academic import router as student_academic_router
 from app.api.v1.endpoints.admin.exam_results import router as admin_exam_results_router
-from app.api.v1.endpoints.admin.students import router as admin_students_router
 from app.api.v1.endpoints.student.alerts import router as student_alerts_router
 
 from app.api.v1.endpoints.student.exam_results import router as student_exam_results_router
@@ -31,7 +30,7 @@ api_router.include_router(admin_courses_router)
 api_router.include_router(admin_announcements_router)
 api_router.include_router(admin_messages_router)
 api_router.include_router(admin_enrollments_router, prefix="/admin/enrollments", tags=["admin-enrollments"])
-api_router.include_router(admin_students_router)
+api_router.include_router(admin_students_router, prefix="/admin/students", tags=["Admin Students"])
 
 # Student
 api_router.include_router(student_courses_router)
