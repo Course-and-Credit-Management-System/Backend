@@ -175,16 +175,15 @@ async def list_exam_results(
 async def delete_exam_result(
     student_id: str,
     course_code: str,
-    year: int,
-    semester: int,
+    year: int | None = None,
+    semester: int | None = None,
     db=Depends(get_db),
 ):
-    filt = {
-        "student_id": student_id,
-        "course_code": course_code,
-        "year": year,
-        "semester": semester,
-    }
+    """Delete exam result. year/semester optional for malformed records."""
+    filt: dict = {"student_id": student_id, "course_code": course_code}
+    if year is not None and semester is not None:
+        filt["year"] = year
+        filt["semester"] = semester
 
     res = await db["ExamResults"].delete_one(filt)
     if res.deleted_count == 0:
