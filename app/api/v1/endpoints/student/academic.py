@@ -13,6 +13,7 @@ from app.services.grade_service import (
     get_result_tag
 )
 from app.api.v1.deps.auth import get_current_user
+from app.services.enrollment_settings_service import get_effective_enrollment_settings_for_user
 
 router = APIRouter()
 
@@ -333,6 +334,7 @@ async def get_current_courses(current_user=Depends(get_current_user)):
     courses = await _get_col(db, ["Courses", "courses"])
     
     user_id = current_user.get("user_id")
+    effective_settings = await get_effective_enrollment_settings_for_user(current_user=current_user)
     
     # Get current enrollments for the student (support multiple possible field names)
     enroll_query = {
@@ -374,7 +376,7 @@ async def get_current_courses(current_user=Depends(get_current_user)):
     return {
         "semester_name": "Current Semester",
         "total_credits": total_credits,
-        "max_credits": 18,
+        "max_credits": float(effective_settings.max_credits),
         "courses_count": len(current_courses),
         "courses": current_courses
     }
@@ -599,12 +601,14 @@ async def request_enrollment(payload: schemas.EnrollmentRequestPayload = None):
     }
 
 @router.get("/enrollment/alerts", response_model=schemas.EnrollmentAlerts)
-async def get_enrollment_alerts():
+async def get_enrollment_alerts(current_user=Depends(get_current_user)):
     """
     Returns warnings like 'Retake Subjects' or 'Credit Limit Exceeded'.
     """
+    effective_settings = await get_effective_enrollment_settings_for_user(current_user=current_user)
+    limit = float(effective_settings.max_credits)
     return {
-        "warnings": ["Max credit limit reached (18/18)"],
+        "warnings": [f"Max credit limit reached ({limit:g}/{limit:g})"],
         "retakes": ["CST-1005 (Failed last semester)"]
     }
 

@@ -2,9 +2,12 @@ from fastapi import APIRouter, Depends, HTTPException, status, Query
 from typing import List, Dict, Any, Optional, Union
 from beanie.operators import In, Or, RegEx
 from app.api.v1.deps.auth import get_current_user
-from app.models.user import User
 from app.models.course import Course, CourseType
 from app.models.enrollment import Enrollment, EnrollmentStatus
+from app.services.enrollment_settings_service import (
+    enforce_enrollment_window_or_403,
+    get_effective_enrollment_settings_for_user,
+)
 from app.services.ai_chat_service import (
     ChatServiceError,
     MissingAIConfigError,
@@ -221,6 +224,7 @@ async def get_current_courses(current_user: Dict[str, Any] = Depends(get_current
     
     # If using Enum in Python, we might get the raw string from DB, so handle both
     current_year_str = str(current_year)
+    effective_settings = await get_effective_enrollment_settings_for_user(current_user=current_user)
     
     # Helper to determine semester term (First vs Second)
     def get_term_parity(sem_str: str) -> str:
@@ -364,6 +368,7 @@ async def get_current_courses(current_user: Dict[str, Any] = Depends(get_current
     return DashboardResponse(
         semester_name=str(current_year),
         total_credits=total_credits,
+        max_credits=float(effective_settings.max_credits),
         courses_count=len(resp_courses),
         courses=resp_courses
     )
@@ -612,6 +617,32 @@ def _cache_drop_ai_plan(cache_key: str, now_ts: float, plan: Dict[str, Any]) -> 
         "expires_at": now_ts + _DROP_AI_CACHE_TTL_SECONDS,
         "plan": plan,
     }
+
+
+async def _get_passed_course_codes(current_user: Dict[str, Any], student_id: str) -> set[str]:
+    student_profile = current_user.get("student_profile") or {}
+    academic_history = student_profile.get("academic_history", []) or current_user.get("academic_history", [])
+
+    passed_statuses = {"passed", "completed"}
+    passing_grades = {"a+", "a", "a-", "b+", "b", "b-", "c+", "c", "d"}
+
+    passed_codes: set[str] = set()
+    for item in academic_history:
+        course_code = str(item.get("course_code") or item.get("course_id") or "").strip()
+        status_value = str(item.get("status") or "").strip().lower()
+        grade_value = str(item.get("grade") or "").strip().lower()
+        if course_code and (status_value in passed_statuses or grade_value in passing_grades):
+            passed_codes.add(course_code)
+
+    db_passed = await Enrollment.find(
+        Enrollment.student_id == student_id,
+        In(Enrollment.status, [EnrollmentStatus.PASSED, EnrollmentStatus.COMPLETED]),
+    ).to_list()
+    for enrollment in db_passed:
+        if enrollment.course_id:
+            passed_codes.add(str(enrollment.course_id))
+
+    return passed_codes
 
 @router.get("", response_model=CourseSearchResponse)
 async def search_courses(
@@ -1001,7 +1032,7 @@ async def course_drop_recommendation(
     if excess_credits <= 0:
         return DropRecommendationResponse(
             exceeds_limit=False,
-            message="Your current enrollment is within the 18-credit limit.",
+            message=f"Your current enrollment is within the {credit_limit:g}-credit limit.",
             credit_limit=credit_limit,
             current_total_credits=total_credits,
             credits_to_drop=0.0,
@@ -1208,10 +1239,10 @@ async def course_drop_recommendation(
     final_elective = next((x for x in selected_items if _is_elective_course(course_map[x.code])), None)
     final_others = [x for x in selected_items if final_elective is None or x.code != final_elective.code]
 
-    response_message = "Recommended courses to drop to meet the 18-credit limit."
+    response_message = f"Recommended courses to drop to meet the {credit_limit:g}-credit limit."
     if ai_unavailable_reason:
         response_message = (
-            "Recommended courses to drop to meet the 18-credit limit "
+            f"Recommended courses to drop to meet the {credit_limit:g}-credit limit "
             "(fallback generated because AI is temporarily unavailable)."
         )
 
@@ -1231,13 +1262,16 @@ async def finalize_enrollment(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     student_id = current_user["user_id"]
-    
+
     # Get semester from student profile
     student_profile = current_user.get("student_profile") or {}
     current_semester = student_profile.get("current_year")
-    
+
     if not current_semester:
          raise HTTPException(status_code=400, detail="Student has no current semester set")
+
+    effective_settings = await get_effective_enrollment_settings_for_user(current_user=current_user)
+    enforce_enrollment_window_or_403(effective_settings)
 
     # Handle single string or list
     codes_to_enroll = []
@@ -1248,51 +1282,80 @@ async def finalize_enrollment(
             codes_to_enroll = [payload.selected_code]
     elif isinstance(payload.selected_code, list):
         codes_to_enroll = payload.selected_code
-    
-    successful_enrollments = 0
-    total_credits = 0
-    
-    for code in codes_to_enroll:
-        # Check if course exists
-        course = await Course.find_one(Course.course_code == code)
-        if not course:
-            continue
-        
-        total_credits += course.credits
 
-        # Check existing enrollment
-        existing = await Enrollment.find_one(
-            Enrollment.student_id == student_id,
-            Enrollment.course_id == code,
-            Enrollment.semester_attend == current_semester
-        )
-        
-        if not existing:
-            # Determine if retake
-            is_retake = False
-            history = current_user.get("academic_history", [])
-            for h in history:
-                if h["course_code"] == code:
-                    is_retake = True
-                    break
-            
-            new_enr = Enrollment(
-                student_id=student_id,
-                course_id=code,
-                semester_attend=str(current_semester),
-                status=EnrollmentStatus.PENDING,
-                is_retake=is_retake
+    codes_to_enroll = [c for c in {str(code).strip() for code in codes_to_enroll} if c]
+    successful_enrollments = 0
+
+    active_enrollments = await Enrollment.find(
+        Enrollment.student_id == student_id,
+        Enrollment.semester_attend == str(current_semester),
+        In(Enrollment.status, [EnrollmentStatus.ENROLLED, EnrollmentStatus.PENDING, EnrollmentStatus.WAITLISTED]),
+    ).to_list()
+    active_course_ids = {e.course_id for e in active_enrollments}
+
+    active_courses = await Course.find(In(Course.course_code, list(active_course_ids))).to_list() if active_course_ids else []
+    active_total_credits = float(sum(float(c.credits) for c in active_courses))
+
+    candidate_courses: List[Course] = []
+    for code in codes_to_enroll:
+        if code in active_course_ids:
+            continue
+        course = await Course.find_one(Course.course_code == code)
+        if course:
+            candidate_courses.append(course)
+
+    if effective_settings.max_courses is not None:
+        projected_count = len(active_course_ids) + len(candidate_courses)
+        if projected_count > int(effective_settings.max_courses):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Enrollment exceeds max_courses limit ({effective_settings.max_courses}).",
             )
-            # Use raw insert
-            doc = new_enr.model_dump(by_alias=True, exclude_none=True)
-            await Enrollment.get_motor_collection().insert_one(doc)
-            successful_enrollments += 1
+
+    projected_total = active_total_credits + sum(float(c.credits) for c in candidate_courses)
+    if projected_total > float(effective_settings.max_credits):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Enrollment exceeds max_credits limit ({effective_settings.max_credits:g}). "
+                f"Projected total is {projected_total:g}."
+            ),
+        )
+
+    passed_codes = await _get_passed_course_codes(current_user=current_user, student_id=student_id)
+    for course in candidate_courses:
+        missing_prereqs = [req for req in (course.prerequisites or []) if req not in passed_codes]
+        if missing_prereqs:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Missing prerequisite(s) for {course.course_code}: {', '.join(missing_prereqs)}",
+            )
+
+    history = student_profile.get("academic_history", []) or current_user.get("academic_history", [])
+    retake_codes = {str(h.get("course_code") or "").strip() for h in history if h.get("course_code")}
+
+    for course in candidate_courses:
+        new_enr = Enrollment(
+            student_id=student_id,
+            course_id=course.course_code,
+            semester_attend=str(current_semester),
+            status=EnrollmentStatus.PENDING,
+            is_retake=course.course_code in retake_codes,
+        )
+        doc = new_enr.model_dump(by_alias=True, exclude_none=True)
+        await Enrollment.get_motor_collection().insert_one(doc)
+        successful_enrollments += 1
+
+    final_total = projected_total
+    remaining_limit = float(effective_settings.max_credits) - final_total
 
     return EnrollmentResponse(
         success=True,
         message="Enrollment request submitted successfully (Pending approval).",
         credit_usage={
-            "total": total_credits, 
-            "remaining_limit": 18 - total_credits # Max 18 assumption
+            "total": final_total,
+            "remaining_limit": remaining_limit,
+            "max_credits": float(effective_settings.max_credits),
+            "successful_enrollments": successful_enrollments,
         }
     )
