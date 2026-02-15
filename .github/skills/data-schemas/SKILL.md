@@ -101,6 +101,24 @@ Tracks a student's relationship with a course for a specific term.
 | `points` | Number | Grade points for GPA (e.g., 4.0, 2.33) |
 | `scores` | Number | Raw numeric score (e.g., 85.5) |
 
+### ExamResults Collection
+Stores finalized per-course exam outcomes for a student in a specific academic term.
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `_id` | ObjectId | System ID |
+| `semester` | Int | `1` or `2` |
+| `student_id` | String | Student identifier (e.g., `TNT-1002`) |
+| `course_code` | String | Course code (e.g., `CST-1010`) |
+| `year` | Int | Academic year (`1` to `5`) |
+| `exam_score` | Number | Numeric score (`0` to `100`) |
+| `grade` | String | Letter grade (e.g., `A`) |
+| `grade_point` | Number | Grade point value (e.g., `4`) |
+| `major` | String or null | Major code; can be `null` for lower years |
+| `section` | String or null | Section value (e.g., `A`, `B`, `C`) |
+| `status` | String | Result state (e.g., `Passed`) |
+| `student_name` | String or null | Optional denormalized name |
+
 ---
 
 ## 4. Communication

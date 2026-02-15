@@ -84,6 +84,29 @@ Behavior:
 - Uses fallback deterministic plan when AI is unavailable/invalid.
 - Uses short-term cache and cooldown to reduce repeated provider calls.
 
+### 3.4 Enrollment Control Settings (Non-AI, affects AI enrollment flows)
+Singleton admin control endpoints:
+- `POST /api/v1/admin/enrollment-settings` (replace old setting)
+- `GET /api/v1/admin/enrollment-settings`
+- `PUT /api/v1/admin/enrollment-settings` (upsert)
+- `PATCH /api/v1/admin/enrollment-settings/status` (`open`/`closed`)
+
+Student read endpoint:
+- `GET /api/v1/student/enrollment/settings/current`
+
+Current behavior:
+- Exactly one enrollment setting document is used.
+- `status=closed` hard-blocks student enrollment requests (`403`).
+- Enrollment window is computed from:
+  - `window_minutes` (testing), or
+  - `window_days` (real operations).
+- `enrollment_open_at` is set to server current time at create/update.
+- Payload was simplified: no `setting_id`, no `academic_year`, no `semester`, no `add_drop_deadline`, no `prerequisite_policy`.
+- Credit-limit enforcement in enrollment/drop flows uses configured `max_credits` instead of a hardcoded value.
+- Timezone behavior:
+  - Server uses `APP_TIMEZONE` (default: `Asia/Yangon`) for setting timestamps and enforcement checks.
+  - Naive timestamps read from MongoDB are treated as UTC and normalized to app timezone to avoid false "closed" states.
+
 ## 4) Context and RAG Strategy
 
 ### 4.1 Structured Context
