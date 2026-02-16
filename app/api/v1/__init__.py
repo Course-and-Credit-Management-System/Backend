@@ -12,10 +12,13 @@ from app.api.v1.endpoints.admin.students import router as admin_students_router
 from app.api.v1.endpoints.student import courses_router as student_courses_router
 from app.api.v1.endpoints.student import enrollment_settings_router as student_enrollment_settings_router
 from app.api.v1.endpoints.student.academic import router as student_academic_router
+from app.api.v1.endpoints.student.progress_flow import router as student_progress_router
+from app.api.v1.endpoints.student.major_select import router as student_major_router
 from app.api.v1.endpoints.admin.exam_results import router as admin_exam_results_router
 from app.api.v1.endpoints.student.alerts import router as student_alerts_router
 from app.api.v1.endpoints.admin.enrollment_settings import router as admin_enrollment_settings_router
 from app.api.v1.endpoints.admin.semester import router as admin_semester_router
+from app.api.v1.endpoints.student.announcements import router as student_announcements_router
 
 from app.api.v1.endpoints.student.exam_results import router as student_exam_results_router
 from app.api.v1.endpoints.ai.chatbot import router as ai_chat_router
@@ -42,7 +45,10 @@ api_router.include_router(admin_students_router, prefix="/admin/students", tags=
 api_router.include_router(student_courses_router)
 api_router.include_router(student_alerts_router)
 api_router.include_router(student_enrollment_settings_router)
+api_router.include_router(student_announcements_router, prefix="/student", tags=["student"])
 api_router.include_router(student_academic_router, prefix="/student", tags=["student"])
+api_router.include_router(student_progress_router, prefix="/student", tags=["student"])
+api_router.include_router(student_major_router, prefix="/student", tags=["student"])
 api_router.include_router(admin_exam_results_router, prefix="/admin", tags=["Admin Exam Results"])
 
 
