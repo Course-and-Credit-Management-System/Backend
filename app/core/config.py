@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     FRONTEND_URL: str
 
     # --- AI / Gemini RAG ---
-    GEMINI_API_KEY: str | None
+    GEMINI_API_KEY: str | None = None  # Optional; app works without AI features
     GEMINI_API_BASE: str = "https://generativelanguage.googleapis.com/v1beta"
     GEMINI_CHAT_MODEL: str = "gemini-2.5-pro"
     GEMINI_CHAT_FALLBACK_MODEL: str = "gemini-2.5-flash"
