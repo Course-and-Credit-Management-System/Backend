@@ -24,7 +24,7 @@ async def major_distribution(_admin=Depends(require_admin), service: AdminDashbo
 async def pending_actions(_admin=Depends(require_admin), service: AdminDashboardService = Depends(svc)):
     return await service.pending_actions()
     
-@router.get("/students")
+@router.get("/students-summary")
 async def list_students(
     _admin=Depends(require_admin),
     service: AdminDashboardService = Depends(svc),

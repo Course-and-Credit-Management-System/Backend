@@ -16,7 +16,7 @@ async def reset_pwd():
     
     creds = db["AuthCredentials"]
     
-    user_id = "TNT-8808"
+    user_id = "ADM-005"
     new_password = "mtt"
     
     # Generate new hash

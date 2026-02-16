@@ -94,24 +94,89 @@ Tracks a student's relationship with a course for a specific term.
 | :--- | :--- | :--- |
 | `student_id` | String | Ref to User |
 | `course_id` | String | Ref to Course |
-| `semesterAttend` | String | e.g., "First Year, First Sem(old)" |
+| `semesterAttend` | String | e.g., `"New . 1st Year . First Sem"` |
 | `is_retake` | Boolean | Flag for repeat attempts |
 | `status` | Enum | `'Enrolled'`, `'Pending'`, `'Conflict'`, `'Waitlisted'`, `'Completed'`, `'Dropped'`, `'Withdrawn'`, `'Failed'`, `'Passed'` |
 | `grade` | Enum | `'A+'`, `'A'`, `'A-'`, `'B+'`, `'B'`, `'B-'`, `'C+'`, `'C'`, `'D'`, `'F'`, `'W'`, `'I'`, `'U'`, `'Abs'` |
 | `points` | Number | Grade points for GPA (e.g., 4.0, 2.33) |
 | `scores` | Number | Raw numeric score (e.g., 85.5) |
 
+### ExamResults Collection
+Stores finalized per-course exam outcomes for a student in a specific academic term.
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `_id` | ObjectId | System ID |
+| `semester` | Int | `1` or `2` |
+| `student_id` | String | Student identifier (e.g., `TNT-1002`) |
+| `course_code` | String | Course code (e.g., `CST-1010`) |
+| `year` | Int | Academic year (`1` to `5`) |
+| `exam_score` | Number | Numeric score (`0` to `100`) |
+| `grade` | String | Letter grade (e.g., `A`) |
+| `grade_point` | Number | Grade point value (e.g., `4`) |
+| `major` | String or null | Major code; can be `null` for lower years |
+| `section` | String or null | Section value (e.g., `A`, `B`, `C`) |
+| `status` | String | Result state (e.g., `Passed`) |
+| `student_name` | String or null | Optional denormalized name |
+
 ---
 
 ## 4. Communication
 
 ### Announcements Collection
-| Field | Type | Constraints |
-| :--- | :--- | :--- |
-| `type` | Enum | `'General'`, `'Urgent'`, `'Event'`, `'Academic'` |
-| `target_audience` | Enum | `'All'`, `'Students'`, `'Faculty'`, `'Computer Science Dept'`, `'Seniors'` |
-| `expiry_date` | Date | Nullable. If null, never expires. |
-| `posted_by` | String | Admin ID |
+`$jsonSchema` definition:
+
+```javascript
+{
+  $jsonSchema: {
+    bsonType: "object",
+    required: [
+      "_id",
+      "title",
+      "content",
+      "posted_by",
+      "date_posted",
+      "target_audience"
+    ],
+    properties: {
+      _id: {
+        bsonType: "string"
+      },
+      title: {
+        bsonType: "string"
+      },
+      content: {
+        bsonType: "string"
+      },
+      type: {
+        bsonType: "string",
+        enum: [
+          "General",
+          "Urgent",
+          "Event",
+          "Academic"
+        ],
+        description: "Determines visual styling and notification priority"
+      },
+      posted_by: {
+        bsonType: "string",
+        description: "Admin ID who created it"
+      },
+      date_posted: {
+        bsonType: "date"
+      },
+      expiry_date: {
+        bsonType: ["date", "null"],
+        description: "Optional date; set to null if the announcement does not expire"
+      },
+      target_audience: {
+        bsonType: "string",
+        description: "Filters who sees this announcement (free text allowed)"
+      }
+    }
+  }
+}
+```
 
 ### Messages Collection
 | Field | Type | Constraints |
@@ -121,22 +186,32 @@ Tracks a student's relationship with a course for a specific term.
 | `sender_id` | String | Admin ID |
 | `receiver_id` | String | Student ID |
 
+### Alerts Collection
+Simple notifications for students.
+| Field | Type | Constraints |
+| :--- | :--- | :--- |
+| `student_id` | String | Target Student ID |
+| `message` | String | Notification content |
+| `is_read` | Boolean | Read status |
+| `created_at` | Date | Creation time |
+
 ---
 
 ## Reference Dictionaries
 
 ### Year & Semester Enum (Crucial)
 This specific format must be used for `current_year` and `semesterAttend`.
+Do not use legacy comma/parenthesis formats like `1st Year, First Sem(new)`.
 
 ```typescript
 type AcademicYear = 
-  | '1st Year, First Sem(new)' | '1st Year, Second Sem(new)'
-  | '2nd Year, First Sem(new)' | '2nd Year, Second Sem(new)'
-  | '3rd Year, First Sem(new)' | '3rd Year, Second Sem(new)'
-  | '4th Year, First Sem(new)' | '4th Year, Second Sem(new)'
-  | '1st Year, First Sem(old)' | '1st Year, Second Sem(old)'
-  | '2nd Year, First Sem(old)' | '2nd Year, Second Sem(old)'
-  | '3rd Year, First Sem(old)' | '3rd Year, Second Sem(old)'
-  | '4th Year, First Sem(old)' | '4th Year, Second Sem(old)'
-  | '5th Year, First Sem(old)' | '5th Year, Second Sem(old)';
+  | 'New . 1st Year . First Sem' | 'New . 1st Year . Second Sem'
+  | 'New . 2nd Year . First Sem' | 'New . 2nd Year . Second Sem'
+  | 'New . 3rd Year . First Sem' | 'New . 3rd Year . Second Sem'
+  | 'New . 4th Year . First Sem' | 'New . 4th Year . Second Sem'
+  | 'Old . 1st Year . First Sem' | 'Old . 1st Year . Second Sem'
+  | 'Old . 2nd Year . First Sem' | 'Old . 2nd Year . Second Sem'
+  | 'Old . 3rd Year . First Sem' | 'Old . 3rd Year . Second Sem'
+  | 'Old . 4th Year . First Sem' | 'Old . 4th Year . Second Sem'
+  | 'Old . 5th Year . First Sem' | 'Old . 5th Year . Second Sem';
 ```

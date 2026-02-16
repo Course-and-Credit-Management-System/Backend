@@ -64,17 +64,7 @@ class CourseUpdate(BaseModel):
     # ✅ syllabus
     syllabus: Optional[List[SyllabusItem]] = None
 
-@router.get("/courses/{course_code}", response_model=CourseDetailsResponse)
-async def get_course_details(course_code: str, _admin=Depends(require_admin)):
-    # Import Course model inside function or at top (checking imports)
-    # We need to ensure Course is imported. It is NOT imported in the read_file output above.
-    from app.models.course import Course
-    
-    course = await Course.find_one(Course.course_code == course_code)
-    if not course:
-        raise HTTPException(status_code=404, detail=f"Course {course_code} not found")
-    
-    return course
+
 
 @router.get("/courses")
 async def api_list_courses(_admin=Depends(require_admin)):

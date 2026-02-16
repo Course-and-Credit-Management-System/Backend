@@ -10,6 +10,8 @@ from app.models.enrollment import Enrollment
 from app.models.announcement import Announcement
 from app.models.message import Message
 from app.models.student_result import StudentResultDB
+from app.models.alert import Alert
+from app.models.enrollment_setting import EnrollmentSetting
 
 settings = get_settings()
 
@@ -49,6 +51,8 @@ async def init_db():
             Announcement,
             Message,
             StudentResultDB,
+            Alert,
+            EnrollmentSetting,
         ]
     )
 

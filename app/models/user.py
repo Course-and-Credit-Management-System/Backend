@@ -25,6 +25,7 @@ class StudentProfile(BaseModel):
     major_id: str
     academic_status: AcademicStatus = AcademicStatus.ACTIVE
     total_credits: int = 0
+    section: Optional[str] = None  # A, B, C for years 1-3
     advisor_id: Optional[str] = None
     is_major_student: bool = False
     gpa: float = Field(default=0.0, ge=0, le=4.0)
@@ -41,6 +42,8 @@ class AdminProfile(BaseModel):
 class User(Document):
     """User document model for MongoDB."""
     
+    # Explicitly define ID as string to allow custom IDs and prevent PydanticObjectId validation errors
+    id: Optional[str] = Field(default=None, alias="_id")
     user_id: str = Field(..., unique=True, description="Unique Identifier (e.g., 'TNT-8801', 'ADM-001')")
     name: str
     email: EmailStr

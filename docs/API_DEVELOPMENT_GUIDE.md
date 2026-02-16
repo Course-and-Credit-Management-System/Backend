@@ -13,22 +13,30 @@ If you use default Beanie behavior (snake_case), queries will return empty resul
 
 ## 1. Database Persistence (Beanie & MongoDB)
 
-### **Handling Custom String IDs**
-By default, Beanie expects MongoDB `_id` fields to be `ObjectId`. Since our legacy data or seeded data uses string IDs (e.g., `"c_101"`, `"auth_01"`), we **must** explicitly define the `id` field in every `Document` model.
+### **Handling Custom String IDs vs ObjectId**
+*   **Custom String IDs**: Used in `User`, `Course` (legacy/seeded data).
+    *   `id: Optional[str] = Field(default=None, alias="_id")`
+*   **Auto-generated ObjectIds**: Used in `Alerts`, new `Enrollments`.
+    *   `id: Optional[PydanticObjectId] = Field(default=None, alias="_id")`
+    *   **CRITICAL**: Do NOT use `Optional[str]` for ObjectId collections. It causes Pydantic Validation Errors on inserts.
 
-**❌ Incorrect (Will fail validation):**
+### **Partial Updates (Avoid `.save()`)**
+When modifying a single field (e.g., Status), **ALWAYS** use atomic update operators (`$set`) instead of `doc.save()`.
+
+**❌ Incorrect (.save()):**
 ```python
-class Course(Document):
-    # Beanie assumes _id is PydanticObjectId
-    course_code: str
+doc.status = "New"
+# Overwrites ENTIRE document. If 'grade' is None in Python, it writes 'null' to DB.
+# Triggers Schema Validation Error 121 if 'null' is forbidden.
+await doc.save()
 ```
 
-**✅ Correct:**
+**✅ Correct (Atomic Update):**
 ```python
-class Course(Document):
-    # Tell Beanie _id is a string
-    id: Optional[str] = Field(default=None, alias="_id")
-    course_code: str
+# Only touches the 'status' field.
+await doc.update({"$set": {"status": "New"}})
+# Update local object reference if needed for subsequent logic
+doc.status = "New"
 ```
 
 ### **Collection Names**
@@ -99,6 +107,21 @@ If the API returns "Internal Server Error" without a clear valid traceback in th
     *   `ModuleNotFoundError`: Missing `__init__.py` or circular imports.
 
 ## 7. Business Logic Implementation
+
+### **Canonical Academic Term String (Critical)**
+`current_year` and `semesterAttend` must use this exact format:
+
+```text
+New . 1st Year . First Sem
+```
+
+Valid families are:
+- `New . {1st|2nd|3rd|4th} Year . {First|Second} Sem`
+- `Old . {1st|2nd|3rd|4th|5th} Year . {First|Second} Sem`
+
+Do not write legacy variants such as:
+- `1st Year, First Sem(new)`
+- `1st Year, Second Sem(old)`
 
 ### **Data Structures inside Models**
 If a field structure is dynamic or mixed (like `semester` containing boolean flags alongside string values), avoid strict typing like `List[Dict[str, str]]`.
@@ -171,3 +194,25 @@ A course is considered **"Already Taken"** if it exists in the user's Global Aca
 ### **Priority of Messages**
 1.  **"Already Taken"**: Always shown first if the course exists in history.
 2.  **"Closed / Version Mismatch"**: Shown if not taken, but context prevents enrollment.
+## 10. Data Enrichment & Joins
+MongoDB Join (`$lookup`) is complex to type with Beanie. Prefer **Application-Side Joins** for simple enrichments.
+
+**Pattern (List Enrollments + Names):**
+1.  Fetch efficient list of source docs (Enrollments).
+2.  Extract unique foreign keys (`student_ids`, `course_ids`).
+3.  Bulk fetch related docs using `In` operator: `User.find(In(User.user_id, student_ids))`.
+4.  Create HashMaps (`id -> data`).
+5.  Map data to response model in Python loop.
+
+## 11. Alerts & Notifications Logic
+*   **Separation of Concerns**: Do not bloat transactional collections (Enrollment) with transient data (Reasons/Messages).
+*   **Alerts Collection**: Store notifications here.
+*   **Logic**:
+    *   Update Enrollment Status (Atomic).
+    *   Create Alert Document (Insert).
+    *   Return Alert Message in API Response.
+
+## 12. Handling MongoDB Schema Validation
+If you encounter `Document failed validation (121)`:
+1.  **Strict Partial Updates**: Use `update({"$set": {...}})` instead of `save()`. `save()` writes the whole document, sending `null` for unset Optional fields, which strict schemas might reject.
+2.  **Schema Patching**: If fields must be nullable (like `grade`), rely on `scripts/fix_enrollment_validator.py` or similar maintenance scripts to adjust `$jsonSchema`.
