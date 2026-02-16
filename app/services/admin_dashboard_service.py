@@ -15,7 +15,7 @@ class AdminDashboardService:
         self.major_histories = db["MajorHistories"]
         self.courses = db["Courses"]
         self.auth_credentials = db["AuthCredentials"]
-
+        self.students_progress = db["students_progress"]
     @classmethod
     async def create(cls) -> "AdminDashboardService":
         db = await get_database()
@@ -76,17 +76,45 @@ class AdminDashboardService:
 
     async def major_distribution(self) -> list[dict[str, Any]]:
         """
-        Users may store:
-        - student_profile.major_id = "CS" (Majors._id)
-        OR
-        - student_profile.major_id = "MAJ-CS-001" (MajorHistories.major_id)
+        Fetch major distribution from students_progress.selected_major
+        (based on the collection in your screenshot), not Users.student_profile.major_id.
         """
+
         pipeline = [
-            {"$match": {"role": "student", "student_profile.major_id": {"$exists": True, "$ne": None, "$ne": ""}}},
-            {"$group": {"_id": "$student_profile.major_id", "count": {"$sum": 1}}},
+            {"$match": {"selected_major": {"$exists": True, "$nin": [None, ""]}}},
+            {
+                # keep only records that belong to real student users
+                "$lookup": {
+                    "from": "Users",
+                    "let": {"sid": "$student_id"},
+                    "pipeline": [
+                        {
+                            "$match": {
+                                "$expr": {
+                                    "$and": [
+                                        {"$eq": ["$role", "student"]},
+                                        {
+                                            "$or": [
+                                                {"$eq": ["$user_id", "$$sid"]},
+                                                {"$eq": ["$id", "$$sid"]},
+                                            ]
+                                        },
+                                    ]
+                                }
+                            }
+                        },
+                        {"$project": {"_id": 1}},
+                    ],
+                    "as": "stu",
+                }
+            },
+            {"$match": {"stu.0": {"$exists": True}}},
+            {"$group": {"_id": "$selected_major", "count": {"$sum": 1}}},
             {"$sort": {"count": -1}},
+            {"$limit": 200},
         ]
-        rows = await self.users.aggregate(pipeline).to_list(length=200)
+
+        rows = await self.students_progress.aggregate(pipeline).to_list(length=200)
 
         output: list[dict[str, Any]] = []
         for r in rows:

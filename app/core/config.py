@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     APP_NAME: str = "FastAPI Boilerplate"
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = False
+    APP_TIMEZONE: str = "Asia/Yangon"
 
     # Database - MongoDB
     MONGODB_URL: str

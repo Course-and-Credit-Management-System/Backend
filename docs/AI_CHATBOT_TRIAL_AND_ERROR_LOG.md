@@ -176,6 +176,61 @@ Copy this block for each trial:
 - Next step:
   - Add integration tests for over-limit, exactly-18, and multiple-elective scenarios
 
+### Experiment ID: EXP-0006
+- Date: 2026-02-15
+- Owner: Backend team
+- Goal: Remove hardcoded enrollment control and make admin-configured singleton setting authoritative
+- Hypothesis: A single enrollment-settings document with explicit status + time window reduces ambiguity and admin friction
+- Change:
+  - Added singleton admin settings endpoints:
+    - `POST /api/v1/admin/enrollment-settings` (replace existing)
+    - `GET /api/v1/admin/enrollment-settings`
+    - `PUT /api/v1/admin/enrollment-settings` (upsert)
+    - `PATCH /api/v1/admin/enrollment-settings/status`
+  - Added student settings read endpoint:
+    - `GET /api/v1/student/enrollment/settings/current`
+  - Removed semester/year and policy/drop-deadline complexity from settings contract
+  - Added duration controls:
+    - `window_minutes` (testing)
+    - `window_days` (real operations)
+  - Enrollment open time is server current time; close time is computed from selected window
+  - `status=closed` now hard-blocks enrollment (`403`) regardless of time window
+- Data/Prompt/Mode used:
+  - N/A (non-chatbot control-plane behavior)
+- Result:
+  - Quality: Admin flow simplified to one object, no id management
+  - Latency: No material impact
+  - Reliability: Enrollment gating became deterministic and test-verified
+- Decision: Keep
+- Notes:
+  - Backward fallback is only for missing setting document; if singleton exists and is closed, enrollment is blocked
+  - Added endpoint-level test coverage for closed-window and closed-status paths
+- Next step:
+  - Add frontend admin page using singleton contract only
+
+### Experiment ID: EXP-0007
+- Date: 2026-02-15
+- Owner: Backend team
+- Goal: Fix enrollment window false-expiry due to timezone mismatch
+- Hypothesis: Naive Mongo datetimes interpreted as local time can shift windows and trigger incorrect `Enrollment period is closed` responses
+- Change:
+  - Added app timezone configuration: `APP_TIMEZONE` (default `Asia/Yangon`)
+  - Added timezone utility normalization for enrollment setting timestamps
+  - Naive DB datetimes are now treated as UTC and converted into app timezone before enforcement
+  - Enrollment setting API responses are normalized to app timezone
+- Data/Prompt/Mode used:
+  - N/A (control-plane/time handling)
+- Result:
+  - Quality: Enrollment time display aligns with admin local time
+  - Latency: No material impact
+  - Reliability: Removed false "closed" rejections for active windows
+- Decision: Keep
+- Notes:
+  - Student enrollment guard continues to enforce `is_active` + time window
+  - Closed status remains a hard block independent of time
+- Next step:
+  - Ensure frontend renders timestamps without unintended client-side timezone shifts
+
 ## Failure/Issue Log
 Use this table for real incidents and regressions.
 
