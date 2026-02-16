@@ -7,7 +7,7 @@ from pydantic import BaseModel, EmailStr
 from app.core.config import settings
 from app.core.database import get_database
 from app.core.security import hash_password, verify_password
-from app.api.v1.deps.auth import get_current_user
+from app.api.v1.deps.auth import _get_col, get_current_user
 
 from app.core.email import send_reset_email
 from app.core.reset_tokens import generate_reset_token, hash_token, get_expiry_time
