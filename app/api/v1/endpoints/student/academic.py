@@ -123,9 +123,8 @@ def _map_student_record(data: dict) -> schemas.CompleteAcademicRecord:
 
 async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas.CompleteAcademicRecord:
     db = await get_database()
+    exam_results = await _get_col(db, ["ExamResults", "exam_results"])
     users = await _get_col(db, ["Users", "users"])
-    enrollments = await _get_col(db, ["Enrollments", "enrollments"])
-    courses = await _get_col(db, ["Courses", "courses"])
     
     # Get user info
     user_doc = None
@@ -137,47 +136,96 @@ async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas
     if not user_doc:
         return get_mock_academic_record()
     
-    # Get student's enrollments (support multiple possible field names)
-    enroll_query = {
-        "$or": [
-            {"student_id": user_id},
-            {"student_user_id": user_id},
-            {"user_id": user_id},
-        ]
-    }
-    enrollment_records = await enrollments.find(enroll_query).to_list(None)
+    # Get exam results for this student
+    exam_query = {"student_id": user_id} if user_id else {}
+    exam_records = await exam_results.find(exam_query).to_list(None)
     
-    if not enrollment_records:
+    if not exam_records:
         return get_mock_academic_record()
     
-    # Build academic history from enrollments
-    academic_history = []
-    for enrollment in enrollment_records:
-        # Resolve course doc robustly by _id or course_code
-        course_id_or_code = enrollment.get("course_id", "") or enrollment.get("course_code", "")
-        course = None
-        if course_id_or_code:
-            course = await courses.find_one({"_id": course_id_or_code})
-            if not course:
-                course = await courses.find_one({"course_code": course_id_or_code})
+    # Group results by year and semester
+    semester_groups = {}
+    for result in exam_records:
+        year_num = result['year']
+        # Convert year number to proper format
+        year_map = {
+            1: "First Year",
+            2: "Second Year", 
+            3: "Third Year",
+            4: "Fourth Year"
+        }
+        year_key = year_map.get(year_num, f"{year_num}th Year")
+        semester_key = "First Semester" if result['semester'] == 1 else "Second Semester"
+        group_key = f"{year_key}, {semester_key}"
         
-        academic_history.append({
-            "course_code": (course or {}).get("course_code", course_id_or_code),
-            "course_title": (course or {}).get("title", course_id_or_code),
-            "grade": enrollment.get("grade", ""),
-            "status": enrollment.get("status", "Unknown"),
-            "semester": enrollment.get("semesterAttend", ""),
-            "credits": (course or {}).get("credits", enrollment.get("credits", 3)),
-            "points": enrollment.get("points", 0),
-            "is_retake": enrollment.get("is_retake", False)
-        })
+        if group_key not in semester_groups:
+            semester_groups[group_key] = []
+        semester_groups[group_key].append(result)
     
-    # Create a combined document for mapping
-    combined_doc = dict(user_doc)
-    combined_doc["academic_history"] = academic_history
+    # Convert to semester structure with GPA calculations
+    semesters_out = []
+    total_credits = 0
+    total_points = 0.0
     
-    # Ensure we pass a dict (Motor returns a dict)
-    return _map_student_record(combined_doc)
+    for key, results in semester_groups.items():
+        # Calculate points only from passed subjects, but include all in denominator
+        passed_results = [r for r in results if r.get('status') not in ['Failed', 'Retake'] and r.get('grade') != 'F']
+        passed_points = sum(2.0 if r.get('status') == 'Passed' and r.get('grade') in ['F', 'D-', 'D', 'D+'] else float(r.get('grade_point', 0)) for r in passed_results)
+        semester_credits = len(passed_results) * 3  # Only passed subjects count for credits
+        semester_gpa = passed_points / len(results) if results else 0.0  # All subjects in denominator
+        
+        total_credits += semester_credits
+        total_points += passed_points
+        
+        # Extract academic year and semester plain
+        academic_year = key.split(', ')[0]
+        semester_plain = key.split(', ')[1]
+        
+        semesters_out.append(
+            schemas.SemesterResult(
+                academic_year=academic_year,
+                semester=semester_plain,
+                results=[
+                    schemas.StudentResult(
+                        course_code=r.get('course_code', ''),
+                        course_title=r.get('course_code', ''),  # Using course_code as title
+                        grade='C' if r.get('status') == 'Passed' and r.get('grade') in ['F', 'D-', 'D', 'D+'] else r.get('grade', ''),
+                        points=float(r.get('grade_point', 0)),
+                        status=r.get('status', 'Unknown'),
+                        result_tag=get_result_tag(r.get('grade', '')),
+                        review_status=r.get('review_status', 'None'),
+                        lecture_hours=2,
+                        tda_hours=2,
+                        credit_unit=3 if r.get('status') in ['Completed', 'Passed'] else 0,
+                        grade_points_earned=2.0 if r.get('status') == 'Passed' and r.get('grade') in ['F', 'D-', 'D', 'D+'] else float(r.get('grade_point', 0))
+                    )
+                    for r in results
+                ],
+                total_credit_unit=semester_credits,
+                total_grade_points=passed_points,
+                gpa=semester_gpa,
+            )
+        )
+    
+    # Calculate overall CGPA (points from passed subjects, denominator includes all subjects)
+    passed_exam_records = [r for r in exam_records if r.get('status') not in ['Failed', 'Retake'] and r.get('grade') != 'F']
+    passed_points = sum(2.0 if r.get('status') == 'Passed' and r.get('grade') in ['F', 'D-', 'D', 'D+'] else float(r.get('grade_point', 0)) for r in passed_exam_records)
+    cgpa = passed_points / len(exam_records) if exam_records else 0.0
+    
+    return schemas.CompleteAcademicRecord(
+        student=schemas.StudentProfile(
+            name=user_doc.get('name') or exam_records[0].get('student_name', 'Student'),
+            nrc=user_doc.get('nrc') or '',
+            sex=user_doc.get('sex') or '',
+            dob=user_doc.get('dob') or ''
+        ),
+        academic_summary=schemas.AcademicSummary(
+            total_credits_earned=total_credits,
+            total_grade_points=total_points,
+            cgpa=cgpa,
+            semesters=semesters_out,
+        ),
+    )
 
 # Mock Data for Multiple Semesters
 def get_mock_academic_record():
