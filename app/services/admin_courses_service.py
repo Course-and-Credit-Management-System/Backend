@@ -21,6 +21,13 @@ def _ensure_str_id(doc: Dict[str, Any]) -> Dict[str, Any]:
     return doc
 
 
+def _normalize_str(value: Optional[Any]) -> Optional[str]:
+    if value is None:
+        return None
+    s = str(value).strip()
+    return s if s else None
+
+
 def _normalize_schedule(value: Optional[Union[str, List[str]]]) -> List[str]:
     """
     Mongo validator expects schedule ARRAY.
@@ -193,6 +200,14 @@ async def create_course(payload: Dict[str, Any]) -> Dict[str, Any]:
     # ✅ syllabus
     doc["syllabus"] = _normalize_syllabus(payload.get("syllabus"))
 
+    # ✅ NEW: major + track (optional)
+    major = _normalize_str(payload.get("major"))
+    track = _normalize_str(payload.get("track"))
+    if major is not None:
+        doc["major"] = major
+    if track is not None:
+        doc["track"] = track
+
     try:
         await db[COLLECTION].insert_one(doc)
     except WriteError as e:
@@ -236,6 +251,17 @@ async def update_course(course_code: str, update_payload: Dict[str, Any]) -> Dic
     # ✅ syllabus
     if "syllabus" in update:
         update["syllabus"] = _normalize_syllabus(update.get("syllabus"))
+
+    # ✅ NEW: major + track (optional)
+    if "major" in update:
+        update["major"] = _normalize_str(update.get("major"))
+        if update["major"] is None:
+            del update["major"]
+
+    if "track" in update:
+        update["track"] = _normalize_str(update.get("track"))
+        if update["track"] is None:
+            del update["track"]
 
     if not update:
         return {"message": "No changes"}

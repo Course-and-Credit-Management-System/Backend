@@ -62,6 +62,14 @@ async def get_current_user(
     cred = await creds.find_one({"user_id": user_id})
     user["must_reset_password"] = bool(cred.get("must_reset_password")) if cred else False
 
+    # Enrich student identity context for /auth/me and AI flows.
+    if (user.get("role") or "").lower() == "student":
+        progress_col = await _get_col(db, ["students_progress", "StudentsProgress"])
+        progress_doc = await progress_col.find_one({"student_id": user_id})
+        if progress_doc:
+            progress_doc["_id"] = str(progress_doc.get("_id"))
+        user["students_progress"] = progress_doc
+
     user.pop("password_hash", None)
     user["_id"] = str(user.get("_id"))
     return user

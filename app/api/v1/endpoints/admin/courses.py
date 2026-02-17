@@ -33,6 +33,10 @@ class CourseCreate(BaseModel):
     type: str
     instructor: Optional[str] = None
 
+    # ✅ NEW
+    major: Optional[str] = None
+    track: Optional[str] = None
+
     # accept both but store as array in service
     schedule: Optional[Union[str, List[str]]] = None
 
@@ -53,6 +57,11 @@ class CourseUpdate(BaseModel):
     credits: Optional[Union[int, float]] = None
     type: Optional[str] = None
     instructor: Optional[str] = None
+
+    # ✅ NEW
+    major: Optional[str] = None
+    track: Optional[str] = None
+
     schedule: Optional[Union[str, List[str]]] = None
     room: Optional[str] = None
     description: Optional[str] = None
@@ -63,7 +72,6 @@ class CourseUpdate(BaseModel):
 
     # ✅ syllabus
     syllabus: Optional[List[SyllabusItem]] = None
-
 
 
 @router.get("/courses")

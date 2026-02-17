@@ -98,7 +98,7 @@ async def list_enrollments(
 ):
     """
     List enrollments. Defaults to filtering for 'Pending' and 'Enrolled' status only.
-    Use ?status=Pending&status=Withdrawn to override.
+    Use ?status=Pending&status=Dropped to override.
     """
     
     query_filters = []
@@ -147,7 +147,7 @@ async def update_enrollment_status(
     current_user: Dict[str, Any] = Depends(require_admin),
 ):
     """
-    Update enrollment status (e.g., Pending -> Enrolled, or -> Withdrawn).
+    Update enrollment status (e.g., Pending -> Enrolled, or -> Dropped).
     """
     
     # Verify ID format
@@ -160,17 +160,21 @@ async def update_enrollment_status(
 
     # Change status
     previous_status = enrollment.status
+    requested_status = update_data.status
+    # Backward compatibility: legacy clients may still send "Withdrawn" for rejection.
+    if requested_status == EnrollmentStatus.WITHDRAWN:
+        requested_status = EnrollmentStatus.DROPPED
     
     # Use atomic update to avoid overwriting other fields (grade, points, scores) with nulls
-    await enrollment.update({"$set": {"status": update_data.status}})
+    await enrollment.update({"$set": {"status": requested_status}})
     
     # Update local instance for subsequent logic
-    enrollment.status = update_data.status
+    enrollment.status = requested_status
 
     # Create Alert for the student
     if enrollment.status == EnrollmentStatus.ENROLLED:
         alert_message = "You have been enrolled"
-    elif enrollment.status == EnrollmentStatus.WITHDRAWN:
+    elif enrollment.status == EnrollmentStatus.DROPPED:
         reason_text = update_data.reason if update_data.reason else "unspecified reason"
         alert_message = f"Your enrollment is rejected because {reason_text}"
     else:

@@ -55,7 +55,7 @@ class AdminDashboardService:
         retake_requirement = await self.enrollments.count_documents(
             {
                 "is_retake": True,
-                "status": {"$in": ["Pending", "Enrolled", "Conflict", "Waitlisted"]},
+                "status": {"$in": ["Pending", "Enrolled", "Failed", "Passed"]},
             }
         )
 
@@ -93,12 +93,8 @@ class AdminDashboardService:
                                 "$expr": {
                                     "$and": [
                                         {"$eq": ["$role", "student"]},
-                                        {
-                                            "$or": [
-                                                {"$eq": ["$user_id", "$$sid"]},
-                                                {"$eq": ["$id", "$$sid"]},
-                                            ]
-                                        },
+                                        {"$eq": ["$user_id", "$$sid"]}  # ✅ correct join
+
                                     ]
                                 }
                             }
@@ -165,7 +161,7 @@ class AdminDashboardService:
         # Conflicting enrollments
         # -------------------------
         schedule_conflicts = await self.enrollments.find(
-            {"status": "Conflict"},
+            {"status": "Pending"},
             {
                 "_id": 1,
                 "student_id": 1,

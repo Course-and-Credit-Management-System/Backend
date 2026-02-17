@@ -4,6 +4,7 @@ from beanie.operators import In, Or, RegEx
 from app.api.v1.deps.auth import get_current_user
 from app.models.course import Course, CourseType
 from app.models.enrollment import Enrollment, EnrollmentStatus
+from app.core.database import get_database
 from app.services.enrollment_settings_service import (
     enforce_enrollment_window_or_403,
     get_effective_enrollment_settings_for_user,
@@ -28,6 +29,14 @@ _drop_ai_plan_cache: Dict[str, Dict[str, Any]] = {}
 _drop_ai_cooldown_until: Dict[str, float] = {}
 _drop_ai_locks: Dict[str, asyncio.Lock] = {}
 
+
+async def _get_col(db, names: List[str]):
+    cols = await db.list_collection_names()
+    for n in names:
+        if n in cols:
+            return db[n]
+    return db[names[0]]
+
 class CourseResponse(BaseModel):
     tag: str
     credits: float
@@ -42,6 +51,9 @@ class CourseSearchItem(BaseModel):
     title: str
     type: str
     credits: float
+    semester: List[str] = Field(default_factory=list)
+    track: Optional[str] = None
+    sort_index: int = 99
     desc: Optional[str] = None
     color: str
     status: str
@@ -225,6 +237,43 @@ async def get_current_courses(current_user: Dict[str, Any] = Depends(get_current
     # If using Enum in Python, we might get the raw string from DB, so handle both
     current_year_str = str(current_year)
     effective_settings = await get_effective_enrollment_settings_for_user(current_user=current_user)
+
+    progress_doc = current_user.get("students_progress") or {}
+    if not progress_doc:
+        db = await get_database()
+        progress_col = await _get_col(db, ["students_progress", "StudentsProgress"])
+        progress_doc = await progress_col.find_one({"student_id": current_user["user_id"]}) or {}
+    selected_major = str(progress_doc.get("selected_major") or "").strip()
+    selected_track = str(progress_doc.get("selected_track") or "").strip()
+
+    passed_codes = await _get_passed_course_codes(
+        current_user=current_user,
+        student_id=str(current_user["user_id"]),
+    )
+
+    def _build_progress_filter() -> Dict[str, Any]:
+        common_course_filter: Dict[str, Any] = {
+            "$and": [
+                {"$or": [{"major": {"$exists": False}}, {"major": None}, {"major": ""}]},
+                {"$or": [{"track": {"$exists": False}}, {"track": None}, {"track": ""}]},
+            ]
+        }
+
+        if selected_major and selected_track:
+            return {"$or": [common_course_filter, {"major": selected_major, "track": selected_track}]}
+        if selected_major:
+            return {"$or": [common_course_filter, {"major": selected_major}]}
+        if selected_track:
+            return {"$or": [common_course_filter, {"track": selected_track}]}
+        return {}
+
+    def _and_filters(*parts: Dict[str, Any]) -> Dict[str, Any]:
+        filtered = [p for p in parts if p]
+        if not filtered:
+            return {}
+        if len(filtered) == 1:
+            return filtered[0]
+        return {"$and": filtered}
     
     # Helper to determine semester term (First vs Second)
     def get_term_parity(sem_str: str) -> str:
@@ -236,10 +285,17 @@ async def get_current_courses(current_user: Dict[str, Any] = Depends(get_current
 
     current_term_parity = get_term_parity(current_year_str)
 
-    # 1. Find all courses that belong to this semester (Standard Curriculum)
-    suitable_courses = await Course.find(
-        {"semester.semester": current_year_str}
-    ).to_list()
+    # 1. Find same-semester courses, then apply major/track and "not already passed".
+    progress_filter = _build_progress_filter()
+    base_course_query: Dict[str, Any] = _and_filters(
+        {"semester.semester": current_year_str},
+        progress_filter,
+    )
+    semester_courses = await Course.find(base_course_query).to_list()
+    suitable_courses = [
+        c for c in semester_courses
+        if c.course_code not in passed_codes
+    ]
     
     # DEBUG: Check what user current year is used to match
     print(f"DEBUG CURRENT: User Year={current_year_str}, Suitable Count={len(suitable_courses)}")
@@ -273,17 +329,35 @@ async def get_current_courses(current_user: Dict[str, Any] = Depends(get_current
     # Fetch Ref objects for retakes
     retake_courses_objs = []
     if retake_course_codes:
-        retake_courses_objs = await Course.find(
-            In(Course.course_code, retake_course_codes)
-        ).to_list()
+        retake_query: Dict[str, Any] = {
+            "course_code": {"$in": retake_course_codes},
+        }
+        retake_query = _and_filters(
+            retake_query,
+            {"semester.semester": current_year_str},
+            progress_filter,
+        )
+        retake_courses_raw = await Course.find(retake_query).to_list()
+        retake_courses_objs = [
+            c for c in retake_courses_raw
+            if c.course_code not in passed_codes
+        ]
 
     # 2. Check for existing enrollments for this semester
     enrollments = await Enrollment.find(
         Enrollment.student_id == current_user["user_id"],
         Enrollment.semester_attend == current_year_str
     ).to_list()
-    
-    existing_course_ids = {e.course_id for e in enrollments}
+
+    existing_course_ids_all = {e.course_id for e in enrollments}
+    existing_course_ids = set()
+    if enrollments:
+        enrollment_codes = [e.course_id for e in enrollments]
+        eligible_codes = {c.course_code for c in suitable_courses}
+        existing_course_ids = {
+            code for code in enrollment_codes
+            if code in eligible_codes and code not in passed_codes
+        }
     
     # 3. Auto-Enroll Logic
     # Standard courses: Auto-enroll ONLY if zero enrollments exist (Fresh start).
@@ -291,10 +365,9 @@ async def get_current_courses(current_user: Dict[str, Any] = Depends(get_current
     
     courses_to_process_map = {}
 
-    # 1. Add Standard Courses (Conditional)
-    if not enrollments:
-        for c in suitable_courses:
-            courses_to_process_map[c.course_code] = c
+    # 1. Add Standard Courses (Always ensure any missing eligible semester course is present)
+    for c in suitable_courses:
+        courses_to_process_map[c.course_code] = c
     
     # 2. Add Retake Courses (Always)
     # This ensures that even if user has other enrollments, a missing Retake is forced in.
@@ -306,7 +379,7 @@ async def get_current_courses(current_user: Dict[str, Any] = Depends(get_current
     retake_codes_set = set(retake_course_codes)
 
     for course in courses_to_process:
-            if course.course_code not in existing_course_ids:
+            if course.course_code not in existing_course_ids_all:
                 # Determine if this specific course is a retake
                 is_retake_course = course.course_code in retake_codes_set
 
@@ -326,18 +399,26 @@ async def get_current_courses(current_user: Dict[str, Any] = Depends(get_current
                 await Enrollment.get_motor_collection().insert_one(doc)
                 
                 enrollments.append(new_enrollment)
+                existing_course_ids_all.add(course.course_code)
                 existing_course_ids.add(course.course_code)
     
     # 4. Format response
     enrollments.sort(key=lambda x: x.is_retake, reverse=True)
 
     enrolled_course_codes = [e.course_id for e in enrollments]
-    courses_data = await Course.find(
-        In(Course.course_code, enrolled_course_codes)
-    ).to_list()
-    
-    # Create a lookup for course data
-    course_lookup = {c.course_code: c for c in courses_data}
+    course_lookup = {}
+    if enrolled_course_codes:
+        response_courses_query: Dict[str, Any] = _and_filters(
+            {"course_code": {"$in": enrolled_course_codes}},
+            {"semester.semester": current_year_str},
+            progress_filter,
+        )
+        courses_data_raw = await Course.find(response_courses_query).to_list()
+        courses_data = [
+            c for c in courses_data_raw
+            if c.course_code not in passed_codes
+        ]
+        course_lookup = {c.course_code: c for c in courses_data}
     
     resp_courses = []
     total_credits = 0.0
@@ -649,6 +730,21 @@ async def search_courses(
     sort: Optional[str] = None,
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
+    sort_tokens = {
+        token.strip().lower()
+        for token in re.split(r"[,\|]", (sort or ""))
+        if token and token.strip()
+    }
+    wants_enrollable_only = "enrollable" in sort_tokens or "enrollment" in sort_tokens
+    wants_major_only = (
+        "major" in sort_tokens
+        or "type:major" in sort_tokens
+        or "course_type:major" in sort_tokens
+    )
+    wants_cs_only = "cs" in sort_tokens or "track:cs" in sort_tokens
+    wants_ct_only = "ct" in sort_tokens or "track:ct" in sort_tokens
+    has_supported_filters = wants_cs_only or wants_ct_only or wants_major_only or wants_enrollable_only
+
     # 1. Fetch courses
     courses = await Course.find_all().to_list(length=None)
 
@@ -674,11 +770,40 @@ async def search_courses(
     if "(new)" in norm_user_year or "new ." in norm_user_year: user_version = "new"
     elif "(old)" in norm_user_year or "old ." in norm_user_year: user_version = "old"
 
+    progress_doc = current_user.get("students_progress") or {}
+    if not progress_doc:
+        db = await get_database()
+        progress_col = await _get_col(db, ["students_progress", "StudentsProgress"])
+        progress_doc = await progress_col.find_one({"student_id": current_user.get("user_id")}) or {}
+    selected_major = str(progress_doc.get("selected_major") or "").strip()
+    selected_track = str(progress_doc.get("selected_track") or "").strip()
+
+    # Course major/track may not be part of the typed model in all datasets.
+    course_meta_map: Dict[str, Dict[str, str]] = {}
+    if selected_major or selected_track:
+        db = await get_database()
+        courses_col = await _get_col(db, ["Courses", "courses"])
+        raw_courses = await courses_col.find({}, {"course_code": 1, "major": 1, "track": 1}).to_list(None)
+        course_meta_map = {
+            str(doc.get("course_code") or "").strip(): {
+                "major": str(doc.get("major") or "").strip(),
+                "track": str(doc.get("track") or "").strip(),
+            }
+            for doc in raw_courses
+            if doc.get("course_code")
+        }
+
     # Identify passed courses
     passed_statuses = ["Passed", "Completed", "A+", "A", "A-", "B+", "B", "B-", "C+", "C", "D"]
     passed_courses = {
         h["course_code"] for h in academic_history 
         if h.get("status") in passed_statuses or h.get("grade") in passed_statuses
+    }
+
+    history_course_codes = {
+        str(h.get("course_code") or h.get("course_id") or "").strip()
+        for h in academic_history
+        if (h.get("course_code") or h.get("course_id"))
     }
 
     # 3. Resolve Prerequisite Titles for error messages
@@ -699,7 +824,19 @@ async def search_courses(
         Enrollment.semester_attend == user_current_year_str
     ).to_list()
     
-    active_course_ids = {e.course_id for e in active_enrollments}
+    active_course_ids = {str(e.course_id or "").strip() for e in active_enrollments if e.course_id}
+    enrolled_course_ids = set()
+    for e in active_enrollments:
+        status_val = getattr(e, "status", "")
+        if hasattr(status_val, "value"):
+            status_text = str(getattr(status_val, "value", "")).strip().lower()
+        else:
+            status_text = str(status_val or "").strip().lower()
+            status_text = status_text.split(".")[-1]
+        if status_text == "enrolled":
+            code = str(getattr(e, "course_id", "") or "").strip()
+            if code:
+                enrolled_course_ids.add(code)
     course_map = {c.course_code: c for c in courses}
     
     busy_slots = []
@@ -786,66 +923,90 @@ async def search_courses(
             if has_schedule_conflict(c_slots, busy_slots):
                 # print(f"DEBUG_SCHED: Conflict detected for {course.course_code}. Slots: {c_slots} vs Busy: {busy_slots}")
                 is_conflict = True
+
+        # Resolve type and major/track compatibility
+        c_type = course.type.value if hasattr(course.type, "value") else str(course.type)
+        course_meta = course_meta_map.get(course.course_code, {})
+        course_major = str(
+            course_meta.get("major")
+            or getattr(course, "major", "")
+            or ""
+        ).strip()
+        course_track = str(
+            course_meta.get("track")
+            or getattr(course, "track", "")
+            or ""
+        ).strip()
+        track_sort_priority = {"CS": 0, "CT": 1}
+        sort_index = track_sort_priority.get(course_track.upper(), 99)
+
+        is_neutral_course = not course_major and not course_track
+        is_program_eligible = True
+
+        if selected_major and selected_track:
+            # When both are present:
+            # 1) exact major+track courses, 2) same-track courses without major, 3) neutral courses.
+            is_program_eligible = (
+                is_neutral_course
+                or (course_major.lower() == selected_major.lower() and course_track.lower() == selected_track.lower())
+                or (not course_major and course_track.lower() == selected_track.lower())
+            )
+        elif selected_track:
+            # Track-only students: same-track courses + neutral courses.
+            is_program_eligible = is_neutral_course or course_track.lower() == selected_track.lower()
+        elif selected_major:
+            # Major-only students: same-major courses + neutral courses.
+            is_program_eligible = is_neutral_course or course_major.lower() == selected_major.lower()
+
+        has_program_mismatch = not is_program_eligible
+        is_currently_enrolled = str(course.course_code or "").strip() in enrolled_course_ids
         
         error_msg = None
         status_str = "normal"
         
         # Priority Logic: Context > Prereq
-        if not valid_context:
+        if is_currently_enrolled:
+            status_str = "locked"
+        elif not valid_context:
             status_str = "locked"
         elif missing_prereqs:
             status_str = "locked"
             error_msg = f"Missing Prerequisite: {', '.join(missing_prereqs)}"
+        elif has_program_mismatch:
+            status_str = "locked"
         elif is_conflict:
              status_str = "locked"
         
-        # C. Check if Retake
-        already_taken = course.course_code in {h["course_code"] for h in academic_history}
+        # C. Course present in academic history is treated as completed/non-enrollable
+        already_taken = course.course_code in history_course_codes
         
         # Get schedule string
         sched = course.schedule[0] if course.schedule else None
-
-        # Resolve type string
-        c_type = course.type.value if hasattr(course.type, "value") else str(course.type)
+        semester_values = []
+        for sem_def in (course.semester or []):
+            if isinstance(sem_def, dict):
+                sem_name = str(sem_def.get("semester") or "").strip()
+            else:
+                sem_name = str(sem_def or "").strip()
+            if sem_name:
+                semester_values.append(sem_name)
 
         # Message Logic
         message_str = None
-        if already_taken:
-             message_str = "this course is already been taken"
+        if is_currently_enrolled:
+             message_str = "you are currently enrolling."
+        elif already_taken:
+             message_str = "this course have been completed."
         elif not valid_context:
              message_str = context_message
+        elif has_program_mismatch:
+             message_str = "this course is not for your major/track"
         elif is_conflict:
              message_str = "schedule conflicted"
 
         # Enrollable Logic
-        # 1. Must be Normal status (unlocked context, prerequisites met)
-        # 2. If already taken, MUST be explicitly 'Failed' to be enrollable (Retake). 
-        #    (If status is missing or 'Passed', it is NOT enrollable).
-        is_enrollable = False
-        if status_str == "normal":
-            if not already_taken:
-                is_enrollable = True
-            else:
-                # Check specific status for retake capability
-                # We know it is in history (already_taken=True)
-                # If it is in passed_courses -> definitely False
-                if course.course_code in passed_courses:
-                    is_enrollable = False
-                else:
-                    # It is in history, but NOT passed.
-                    # Check if explicitly Failed.
-                    hist_entry = next((h for h in academic_history if h.get("course_code") == course.course_code), None)
-                    if hist_entry:
-                        stat = str(hist_entry.get("status", "")).lower()
-                        grade = str(hist_entry.get("grade", "")).lower()
-                        # Allow retry if Failed or F
-                        if stat in ["failed", "fail", "f"] or grade in ["f", "fail"]:
-                            is_enrollable = True
-                        else:
-                            # Ambiguous or 'Taken' matches user request for False
-                            is_enrollable = False
-                    else:
-                        is_enrollable = False
+        # Must pass all checks and must not be present in academic history.
+        is_enrollable = status_str == "normal" and not already_taken
         
         # Override status if not enrollable (for UI consistency)
         if not is_enrollable and status_str == "normal":
@@ -856,6 +1017,9 @@ async def search_courses(
             title=course.title,
             type=c_type,
             credits=course.credits,
+            semester=semester_values,
+            track=course_track or None,
+            sort_index=sort_index,
             desc=course.description,
             color=get_course_color(c_type),
             status=status_str,
@@ -866,11 +1030,22 @@ async def search_courses(
             enrollable=is_enrollable
         ))
     
-    if sort and sort.lower() == 'enrollable':
+    if wants_cs_only:
+        response_data = [item for item in response_data if (item.track or "").upper() == "CS"]
+
+    if wants_ct_only:
+        response_data = [item for item in response_data if (item.track or "").upper() == "CT"]
+
+    if wants_major_only:
+        response_data = [item for item in response_data if item.type.lower() == "major"]
+
+    if wants_enrollable_only:
         # Filter to only include enrollable courses as requested
         response_data = [item for item in response_data if item.enrollable]
-        # Optional: still sort alphabetically
-        response_data.sort(key=lambda x: x.code)
+
+    if has_supported_filters:
+        # Keep deterministic output for filtered views with track ordering (CS, CT, then others).
+        response_data.sort(key=lambda x: (x.sort_index, x.code))
 
     return CourseSearchResponse(
         data=response_data,

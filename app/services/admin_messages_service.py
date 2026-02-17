@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import uuid
 from fastapi import HTTPException
@@ -18,9 +18,6 @@ COLLECTION = "Messages"
 # ============================================================
 
 def _admin_id(admin: Any) -> str:
-    """
-    Keeps your current behavior.
-    """
     if isinstance(admin, dict):
         return admin.get("user_id") or admin.get("id") or "ADM-UNKNOWN"
     return getattr(admin, "user_id", None) or getattr(admin, "id", None) or "ADM-UNKNOWN"
@@ -37,6 +34,11 @@ def _ensure_str_id(doc: Dict[str, Any]) -> Dict[str, Any]:
 # ============================================================
 
 async def list_messages(admin: Any) -> List[Dict[str, Any]]:
+    """
+    Admin sees messages they SENT.
+    - is_read = student read flag (stored in DB)
+    - is_read_by_admin = computed from read_by_admins
+    """
     db = await get_database()
     admin_id = _admin_id(admin)
 
@@ -51,10 +53,13 @@ async def list_messages(admin: Any) -> List[Dict[str, Any]]:
     for m in msgs:
         _ensure_str_id(m)
 
-        read_by = m.get("read_by_admins") or []
-        m["is_read"] = admin_id in read_by
+        read_by_admins = m.get("read_by_admins") or []
+        m["is_read_by_admin"] = admin_id in read_by_admins
 
-        # don't leak internal list
+        # keep is_read as the DB field (student read badge)
+        m["is_read"] = bool(m.get("is_read", False))
+
+        # don't leak internal list unless you want it
         if "read_by_admins" in m:
             del m["read_by_admins"]
 
@@ -70,7 +75,6 @@ async def send_message(payload: Dict[str, Any], admin: Any) -> Dict[str, Any]:
     subject = (payload.get("subject") or "").strip()
     body = (payload.get("body") or "").strip()
     category = (payload.get("category") or "General").strip()
-
     attachments = payload.get("attachments")
 
     if not receiver_id or not subject or not body:
@@ -91,12 +95,12 @@ async def send_message(payload: Dict[str, Any], admin: Any) -> Dict[str, Any]:
         "subject": subject,
         "body": body,
         "sent_at": datetime.utcnow(),
-        "read_by_admins": [],
+        "is_read": False,          # ✅ REQUIRED by your validator
+        "read_by_admins": [],      # ✅ keep if validator allows it
         "category": category or "General",
     }
 
     if attachments is not None:
-        # keep as-is (frontend expects list[str] maybe)
         doc["attachments"] = attachments
 
     try:
@@ -110,6 +114,10 @@ async def send_message(payload: Dict[str, Any], admin: Any) -> Dict[str, Any]:
 
 
 async def mark_message_read(message_id: str, is_read: bool, admin: Any) -> Dict[str, Any]:
+    """
+    This marks whether THIS ADMIN has viewed the message (read_by_admins).
+    It does NOT change student read state (is_read).
+    """
     db = await get_database()
     admin_id = _admin_id(admin)
 
