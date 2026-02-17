@@ -32,6 +32,137 @@ _drop_ai_plan_cache: Dict[str, Dict[str, Any]] = {}
 _drop_ai_cooldown_until: Dict[str, float] = {}
 _drop_ai_locks: Dict[str, asyncio.Lock] = {}
 
+def _detect_semester_parity(value: Any) -> str:
+    norm = str(value or "").strip().lower()
+    if "first sem" in norm or "firstsem" in norm or "1st sem" in norm:
+        return "first"
+    if "second sem" in norm or "secondsem" in norm or "2nd sem" in norm:
+        return "second"
+    return "unknown"
+
+
+def _detect_academic_year(value: Any) -> str:
+    norm = str(value or "").strip().lower()
+    if not norm:
+        return "unknown"
+
+    ordinal_match = re.search(r"\b([1-9])(?:st|nd|rd|th)\s*year\b", norm)
+    if ordinal_match:
+        return ordinal_match.group(1)
+
+    word_map = {
+        "first year": "1",
+        "second year": "2",
+        "third year": "3",
+        "fourth year": "4",
+        "fifth year": "5",
+        "sixth year": "6",
+    }
+    for phrase, year_no in word_map.items():
+        if phrase in norm:
+            return year_no
+    return "unknown"
+
+
+def _detect_semester_version(value: Any) -> str:
+    norm = str(value or "").strip().lower()
+    if not norm:
+        return "unknown"
+    # Accept multiple notations: "(new)", "new .", "new •", "new -", "new ..."
+    if re.search(r"\bnew\b", norm):
+        return "new"
+    if re.search(r"\bold\b", norm):
+        return "old"
+    return "unknown"
+
+
+def _is_new_student(current_year: Any) -> bool:
+    return _detect_semester_version(current_year) == "new"
+
+
+def _parse_semester_label(value: Any) -> tuple[str, str, str]:
+    """
+    Strict parser for labels like:
+    'New . 3rd Year. First Sem.'
+    'New • 3rd Year • First Sem'
+    Returns: (version, year, parity) or ('unknown','unknown','unknown') if format not matched.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return ("unknown", "unknown", "unknown")
+
+    norm = raw.lower()
+    # strict separators with dot/bullet style; tolerate extra spaces and trailing dot.
+    m = re.match(
+        r"^\s*(new|old)\s*[\.•]\s*([1-9](?:st|nd|rd|th)\s*year)\s*[\.•]\s*(first|second)\s*sem\.?\s*$",
+        norm,
+    )
+    if not m:
+        return ("unknown", "unknown", "unknown")
+
+    version = m.group(1)
+    year = _detect_academic_year(m.group(2))
+    parity = "first" if m.group(3) == "first" else "second"
+    return (version, year, parity)
+
+
+def _is_program_eligible_for_student(
+    *,
+    is_new_student: bool,
+    selected_major: str,
+    selected_track: str,
+    course_major: str,
+    course_track: str,
+) -> bool:
+    student_major = str(selected_major or "").strip().lower()
+    student_track = str(selected_track or "").strip().lower()
+    c_major = str(course_major or "").strip().lower()
+    c_track = str(course_track or "").strip().lower()
+
+    # Neutral course per requested rule: no major.
+    is_neutral_course = not c_major
+
+    if is_new_student:
+        if student_major:
+            return is_neutral_course or c_major == student_major
+        return True
+
+    has_major = bool(student_major)
+    has_track = bool(student_track)
+
+    if has_track and not has_major:
+        return is_neutral_course or c_track == student_track
+    if has_track and has_major:
+        return is_neutral_course or (c_major == student_major and c_track == student_track)
+    if not has_major and not has_track:
+        return True
+
+    # Fallback for partial profile data.
+    return True
+
+
+def _course_matches_current_context(course: Any, current_year: Any) -> bool:
+    """A course is valid if any semester entry matches student's current year context."""
+    semester_defs = getattr(course, "semester", None) or []
+    if not semester_defs:
+        return False
+
+    user_version, user_year, user_parity = _parse_semester_label(current_year)
+    if "unknown" in {user_version, user_year, user_parity}:
+        return False
+
+    for sem_def in semester_defs:
+        if isinstance(sem_def, dict):
+            sem_name = sem_def.get("semester", "")
+        else:
+            sem_name = sem_def
+        sem_version, sem_year, sem_parity = _parse_semester_label(sem_name)
+        if (sem_version, sem_year, sem_parity) == (user_version, user_year, user_parity):
+            # OR logic across multiple semester entries: one match is enough.
+            return True
+
+    return False
+
 
 async def _get_col(db, names: List[str]):
     cols = await db.list_collection_names()
@@ -239,6 +370,7 @@ async def get_current_courses(current_user: Dict[str, Any] = Depends(get_current
     
     # If using Enum in Python, we might get the raw string from DB, so handle both
     current_year_str = str(current_year)
+    is_new_student = _is_new_student(current_year_str)
     effective_settings = await get_effective_enrollment_settings_for_user(current_user=current_user)
 
     progress_doc = current_user.get("students_progress") or {}
@@ -255,19 +387,26 @@ async def get_current_courses(current_user: Dict[str, Any] = Depends(get_current
     )
 
     def _build_progress_filter() -> Dict[str, Any]:
-        common_course_filter: Dict[str, Any] = {
-            "$and": [
-                {"$or": [{"major": {"$exists": False}}, {"major": None}, {"major": ""}]},
-                {"$or": [{"track": {"$exists": False}}, {"track": None}, {"track": ""}]},
-            ]
+        # Neutral = course has no major (track is ignored for neutrality).
+        neutral_course_filter: Dict[str, Any] = {
+            "$or": [{"major": {"$exists": False}}, {"major": None}, {"major": ""}]
         }
 
+        # New students ignore track constraints entirely.
+        if is_new_student:
+            if selected_major:
+                return {"$or": [neutral_course_filter, {"major": selected_major}]}
+            # No major for new students => semester-only
+            return {}
+
+        # Old students:
+        # - track only => same track OR neutral(no major)
+        # - major + track => same major+track OR neutral(no major)
+        # - major only / neither => semester-only
         if selected_major and selected_track:
-            return {"$or": [common_course_filter, {"major": selected_major, "track": selected_track}]}
-        if selected_major:
-            return {"$or": [common_course_filter, {"major": selected_major}]}
+            return {"$or": [neutral_course_filter, {"major": selected_major, "track": selected_track}]}
         if selected_track:
-            return {"$or": [common_course_filter, {"track": selected_track}]}
+            return {"$or": [neutral_course_filter, {"track": selected_track}]}
         return {}
 
     def _and_filters(*parts: Dict[str, Any]) -> Dict[str, Any]:
@@ -280,24 +419,22 @@ async def get_current_courses(current_user: Dict[str, Any] = Depends(get_current
     
     # Helper to determine semester term (First vs Second)
     def get_term_parity(sem_str: str) -> str:
-        if "First Sem" in sem_str:
+        parity = _detect_semester_parity(sem_str)
+        if parity == "first":
             return "First Sem"
-        elif "Second Sem" in sem_str:
+        if parity == "second":
             return "Second Sem"
         return "Unknown"
 
     current_term_parity = get_term_parity(current_year_str)
 
-    # 1. Find same-semester courses, then apply major/track and "not already passed".
+    # 1. Find semester-compatible courses, then apply major/track and "not already passed".
     progress_filter = _build_progress_filter()
-    base_course_query: Dict[str, Any] = _and_filters(
-        {"semester.semester": current_year_str},
-        progress_filter,
-    )
+    base_course_query: Dict[str, Any] = _and_filters(progress_filter)
     semester_courses = await Course.find(base_course_query).to_list()
     suitable_courses = [
         c for c in semester_courses
-        if c.course_code not in passed_codes
+        if c.course_code not in passed_codes and _course_matches_current_context(c, current_year_str)
     ]
     
     # DEBUG: Check what user current year is used to match
@@ -337,13 +474,12 @@ async def get_current_courses(current_user: Dict[str, Any] = Depends(get_current
         }
         retake_query = _and_filters(
             retake_query,
-            {"semester.semester": current_year_str},
             progress_filter,
         )
         retake_courses_raw = await Course.find(retake_query).to_list()
         retake_courses_objs = [
             c for c in retake_courses_raw
-            if c.course_code not in passed_codes
+            if c.course_code not in passed_codes and _course_matches_current_context(c, current_year_str)
         ]
 
     # 2. Check for existing enrollments for this semester
@@ -413,13 +549,12 @@ async def get_current_courses(current_user: Dict[str, Any] = Depends(get_current
     if enrolled_course_codes:
         response_courses_query: Dict[str, Any] = _and_filters(
             {"course_code": {"$in": enrolled_course_codes}},
-            {"semester.semester": current_year_str},
             progress_filter,
         )
         courses_data_raw = await Course.find(response_courses_query).to_list()
         courses_data = [
             c for c in courses_data_raw
-            if c.course_code not in passed_codes
+            if c.course_code not in passed_codes and _course_matches_current_context(c, current_year_str)
         ]
         course_lookup = {c.course_code: c for c in courses_data}
     
@@ -787,16 +922,7 @@ async def search_courses(
     
     user_current_year_str = str(student_profile.get("current_year", ""))
     
-    user_parity = "Unknown"
-    norm_user_year = user_current_year_str.lower()
-    if "first sem" in norm_user_year or "firstsem" in norm_user_year or "1st sem" in norm_user_year: 
-        user_parity = "First"
-    elif "second sem" in norm_user_year or "secondsem" in norm_user_year or "2nd sem" in norm_user_year:
-        user_parity = "Second"
-    
-    user_version = "Unknown"
-    if "(new)" in norm_user_year or "new ." in norm_user_year: user_version = "new"
-    elif "(old)" in norm_user_year or "old ." in norm_user_year: user_version = "old"
+    is_new_student = _is_new_student(user_current_year_str)
 
     progress_doc = current_user.get("students_progress") or {}
     if not progress_doc:
@@ -805,7 +931,6 @@ async def search_courses(
         progress_doc = await progress_col.find_one({"student_id": current_user.get("user_id")}) or {}
     selected_major = str(progress_doc.get("selected_major") or "").strip()
     selected_track = str(progress_doc.get("selected_track") or "").strip()
-
     # Course major/track may not be part of the typed model in all datasets.
     course_meta_map: Dict[str, Dict[str, str]] = {}
     if selected_major or selected_track:
@@ -881,62 +1006,12 @@ async def search_courses(
     response_data = []
 
     for course in courses:
-        # A. Check Validity (Parity + Version)
-        # Assuming course.semester is List[Dict] or List. 
-        # If empty, ignore rules (assume universal).
-        
+        # A. Check validity against current student semester context.
         valid_context = True
         context_message = None
-        
-        if course.semester:
-            has_matching_parity = False
-            has_matching_version = False
-            
-            # Check against ALL definitions. If ANY fits, it's valid.
-            for sem_def in course.semester:
-                # Handle if sem_def is dict or string
-                sem_name = ""
-                if isinstance(sem_def, dict):
-                    sem_name = str(sem_def.get("semester", ""))
-                else:
-                    sem_name = str(sem_def)
-
-                norm_sem = sem_name.lower()
-                c_parity = "Unknown"
-                if "first sem" in norm_sem or "firstsem" in norm_sem or "1st sem" in norm_sem: c_parity = "First"
-                elif "second sem" in norm_sem or "secondsem" in norm_sem or "2nd sem" in norm_sem: c_parity = "Second"
-                
-                c_version = "Unknown"
-                if "(new)" in norm_sem or "new ." in norm_sem: c_version = "new"
-                elif "(old)" in norm_sem or "old ." in norm_sem: c_version = "old"
-                
-                # Check Parity Match
-                if c_parity == user_parity:
-                    has_matching_parity = True
-                    
-                    # Check Version Match (Strict if tags exist)
-                    is_compatible_version = True
-                    if c_version == "new" and user_version != "new":
-                        is_compatible_version = False
-                    elif c_version == "old" and user_version != "old":
-                         is_compatible_version = False
-                    
-                    if is_compatible_version:
-                        has_matching_version = True
-            
-            # If no semester definitions matched parity
-            if not has_matching_parity:
-                valid_context = False
-                context_message = "this course has been closed"
-            
-            # If parity matched, but version failed
-            elif not has_matching_version:
-                valid_context = False
-                # Specific logic for exact message
-                if user_version == "new":
-                    context_message = "this course is for old student"
-                else:
-                    context_message = "this course is for new student"
+        if not _course_matches_current_context(course, user_current_year_str):
+            valid_context = False
+            context_message = "this course has been closed"
 
         # B. Check prerequisites
         missing_prereqs = []
@@ -968,23 +1043,13 @@ async def search_courses(
         track_sort_priority = {"CS": 0, "CT": 1}
         sort_index = track_sort_priority.get(course_track.upper(), 99)
 
-        is_neutral_course = not course_major and not course_track
-        is_program_eligible = True
-
-        if selected_major and selected_track:
-            # When both are present:
-            # 1) exact major+track courses, 2) same-track courses without major, 3) neutral courses.
-            is_program_eligible = (
-                is_neutral_course
-                or (course_major.lower() == selected_major.lower() and course_track.lower() == selected_track.lower())
-                or (not course_major and course_track.lower() == selected_track.lower())
-            )
-        elif selected_track:
-            # Track-only students: same-track courses + neutral courses.
-            is_program_eligible = is_neutral_course or course_track.lower() == selected_track.lower()
-        elif selected_major:
-            # Major-only students: same-major courses + neutral courses.
-            is_program_eligible = is_neutral_course or course_major.lower() == selected_major.lower()
+        is_program_eligible = _is_program_eligible_for_student(
+            is_new_student=is_new_student,
+            selected_major=selected_major,
+            selected_track=selected_track,
+            course_major=course_major,
+            course_track=course_track,
+        )
 
         has_program_mismatch = not is_program_eligible
         is_currently_enrolled = str(course.course_code or "").strip() in enrolled_course_ids
