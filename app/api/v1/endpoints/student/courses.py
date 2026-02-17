@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi.responses import StreamingResponse
 from typing import List, Dict, Any, Optional, Union
 from beanie.operators import In, Or, RegEx
 from app.api.v1.deps.auth import get_current_user
@@ -21,6 +22,8 @@ import json
 import re
 import uuid
 import time
+from datetime import datetime
+from app.services.pdf_service import generate_current_courses_pdf
 
 router = APIRouter(prefix="/student/courses", tags=["student-courses"])
 _DROP_AI_CACHE_TTL_SECONDS = 120
@@ -453,6 +456,31 @@ async def get_current_courses(current_user: Dict[str, Any] = Depends(get_current
         courses_count=len(resp_courses),
         courses=resp_courses
     )
+
+
+@router.get("/current/pdf")
+async def download_current_courses_pdf(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Generate and download current course schedule as a professional PDF."""
+    schedule = await get_current_courses(current_user)
+    schedule_payload = schedule.model_dump() if hasattr(schedule, "model_dump") else dict(schedule)
+    student_profile = current_user.get("student_profile") or {}
+
+    pdf_buffer = generate_current_courses_pdf(
+        {
+            "student": {
+                "name": current_user.get("name") or "",
+                "user_id": current_user.get("user_id") or "",
+                "current_year": student_profile.get("current_year") or "",
+            },
+            "schedule": schedule_payload,
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    )
+
+    headers = {
+        "Content-Disposition": 'attachment; filename="current_course_schedule.pdf"'
+    }
+    return StreamingResponse(pdf_buffer, media_type="application/pdf", headers=headers)
 
 
 def get_course_color(course_type: str) -> str:
