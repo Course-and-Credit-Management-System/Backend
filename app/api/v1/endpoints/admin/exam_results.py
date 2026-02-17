@@ -167,6 +167,19 @@ async def list_exam_results(
             r["section"] = None
         if r.get("major") == "" or r.get("major") is None:
             r["major"] = None
+        # Normalize year/semester/section for malformed records so edit/save work
+        yr = r.get("year")
+        if yr is None:
+            r["year"] = 1
+            yr = 1
+        if r.get("semester") is None:
+            r["semester"] = 1
+        if 1 <= yr <= 3 and (r.get("section") is None or r.get("section") == ""):
+            r["section"] = "A"
+        if yr == 3 and (r.get("major") is None or r.get("major") == ""):
+            r["major"] = "CS"
+        if yr in [4, 5] and (r.get("major") is None or r.get("major") == ""):
+            r["major"] = "SE"
         out.append(r)
 
     return out
@@ -216,6 +229,10 @@ async def upsert_exam_result(payload: ExamResultUpsertIn, db=Depends(get_db)):
         "semester": payload.semester,
     }
 
-    await db["ExamResults"].update_one(filt, {"$set": doc}, upsert=True)
+    res = await db["ExamResults"].update_one(filt, {"$set": doc}, upsert=False)
+    if res.matched_count == 0:
+        # Handle malformed records that lack year/semester
+        filt_partial = {"student_id": payload.student_id, "course_code": payload.course_code}
+        await db["ExamResults"].update_one(filt_partial, {"$set": doc}, upsert=False)
 
     return doc
