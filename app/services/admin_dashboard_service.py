@@ -264,6 +264,22 @@ class AdminDashboardService:
 
         return students
 
+    def _parse_year_semester(self, current_year) -> tuple:
+        """Parse current_year string to (year, semester). Same logic as students router."""
+        year_str = current_year.value if hasattr(current_year, "value") else str(current_year or "")
+        year, semester = 1, 1
+        if "5th Year" in year_str or "5th" in year_str:
+            year = 5
+        elif "4th Year" in year_str or "4th" in year_str:
+            year = 4
+        elif "3rd Year" in year_str or "3rd" in year_str:
+            year = 3
+        elif "2nd Year" in year_str or "2nd" in year_str:
+            year = 2
+        if "Second Sem" in year_str or "2nd Sem" in year_str or "Sem 2" in year_str:
+            semester = 2
+        return year, semester
+
     async def get_student_details(self, student_id: str):
         student = await self.users.find_one({"role": "student", "user_id": student_id})
         if not student:
@@ -296,6 +312,25 @@ class AdminDashboardService:
         }
         enrollments = await self.enrollments.find(enroll_query).to_list(length=200)
 
+        # Credits: use total_credits_completed, or compute from Passed enrollments if missing
+        total_credits = int(sp.get("total_credits_completed") or sp.get("total_credits") or 0)
+        if total_credits == 0:
+            for e in enrollments:
+                if (e.get("status") or "").lower() == "passed":
+                    code = e.get("course_id") or e.get("course_code")
+                    if code:
+                        c = await self.courses.find_one({"course_code": code})
+                        if c and c.get("credits"):
+                            total_credits += int(c["credits"])
+        required_credits = int(sp.get("credits_required") or sp.get("creditsRequired") or 120)
+
+        # Year/semester from current_year (same as Students List)
+        curr_yr = sp.get("current_year") or "1st Year, First Sem(new)"
+        try:
+            year_num, sem_num = self._parse_year_semester(curr_yr)
+        except Exception:
+            year_num, sem_num = 1, 1
+
         enrollment_rows = []
         for e in enrollments:
             if "_id" in e:
@@ -315,21 +350,25 @@ class AdminDashboardService:
                     "code": course_code or "-",
                     "name": title,
                     "credits": int(credits) if isinstance(credits, (int, float)) else 0,
-                    "grade": e.get("grade") or "-",
-                    "status": e.get("status") or "Enrolled",
+                    "grade": (e.get("grade").value if hasattr(e.get("grade"), "value") else e.get("grade")) or "-",
+                    "status": (e.get("status").value if hasattr(e.get("status"), "value") else e.get("status")) or "Enrolled",
                 }
             )
 
         payload = {
             "id": student.get("user_id") or student.get("id") or student_id,
+            "user_id": student.get("user_id") or student.get("id") or student_id,
             "name": student.get("name", "Unknown"),
             "email": student.get("email", ""),
-            "major": major_name or major_id or "—",
-            "year": sp.get("year") or "—",
-            "gpa": sp.get("gpa") or 0.0,
+            "major": major_id or "CS",
+            "major_name": major_name or major_id or "—",
+            "year": year_num,
+            "semester": sem_num,
+            "section": sp.get("section"),
+            "gpa": float(sp.get("gpa") or sp.get("cgpa") or 0.0),
             "advisor": sp.get("advisor") or sp.get("advisor_name") or "—",
-            "creditsEarned": sp.get("credits_earned") or sp.get("creditsEarned") or 0,
-            "creditsRequired": sp.get("credits_required") or sp.get("creditsRequired") or 0,
+            "creditsEarned": total_credits,
+            "creditsRequired": required_credits,
             "status": sp.get("academic_status") or student.get("status") or "Active",
             "avatar": sp.get("avatar") or "",
             "enrollments": enrollment_rows,
