@@ -119,6 +119,24 @@ Stores finalized per-course exam outcomes for a student in a specific academic t
 | `status` | String | Result state (e.g., `Passed`) |
 | `student_name` | String or null | Optional denormalized name |
 
+### students_progress Collection
+Collection name is intentionally lowercase: `students_progress`.
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `_id` | ObjectId | System ID |
+| `student_id` | String | Student identifier (e.g., `TNT-8809`) |
+| `academic_year` | String | Academic year label (e.g., `2024-2025`) |
+| `created_at` | Date | Document creation timestamp |
+| `updated_at` | Date | Last update timestamp |
+| `program_type` | String | Program category (e.g., `4-year`) |
+| `program_rule_note` | String | Human-readable rule note for current program |
+| `program_duration` | String | Program duration value (e.g., `4-year`) |
+| `current_year` | String | Current study year (e.g., `First Year`) |
+| `current_semester` | String | Current semester label (e.g., `Second Semester`) |
+| `selected_major` | String | Selected major code (e.g., `SE`) |
+| `selected_track` | String, null, or missing | Optional track code (e.g., `CS`); may be `null` or absent |
+
 ---
 
 ## 4. Communication

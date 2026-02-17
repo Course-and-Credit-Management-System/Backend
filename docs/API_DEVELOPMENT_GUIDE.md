@@ -165,9 +165,11 @@ await Enrollment.find(...).update({"$set": {"status": EnrollmentStatus.DROPPED}}
 
 ### **Filters & Sorting**
 - **Filtering**: Server-side string searching (`q`) is removed; search is handled by frontend.
-- **Sorting**: `sort="enrollable"` is a strict filter.
-  - **Action**: Returns ONLY courses where `enrollable: true`.
-  - **Ordering**: Alphabetical by `code`.
+- **Sorting / Filter tokens**: `sort` accepts comma-separated tokens.
+  - `sort="enrollable"`: Returns ONLY courses where `enrollable: true`.
+  - `sort="major"`: Returns ONLY courses where `type == "Major"`.
+  - `sort="major,enrollable"` (or reversed): Returns ONLY major courses that are enrollable.
+  - **Ordering**: Alphabetical by `code` whenever a filter token is used.
 
 ### **Validation Rules (Parity & Version)**
 To determine if a user can enroll (Status: "normal"):
