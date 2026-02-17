@@ -25,7 +25,12 @@ async def init_db():
     
     # Use connection string from environment
     # For Atlas, the connection string should include tls parameters
-    client = AsyncIOMotorClient(settings.MONGODB_URL)
+    client = AsyncIOMotorClient(
+        settings.MONGODB_URL,
+        serverSelectionTimeoutMS=5000,  # 5 second timeout
+        connectTimeoutMS=10000,  # 10 second connection timeout
+        socketTimeoutMS=20000  # 20 second socket timeout
+    )
     database = client[settings.MONGODB_DB_NAME]
     
     # Test connection
