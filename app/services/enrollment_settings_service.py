@@ -16,7 +16,7 @@ def build_fallback_setting() -> StudentEnrollmentSettingResponse:
     return StudentEnrollmentSettingResponse(
         enrollment_open_at=None,
         enrollment_close_at=None,
-        max_credits=18.0,
+        max_credits=24.0,
         max_courses=None,
         allow_waitlist=False,
         is_active=True,

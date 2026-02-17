@@ -9,6 +9,7 @@ import hashlib
 import httpx
 import json
 import math
+import re
 import time
 
 from app.core.config import settings
@@ -549,6 +550,94 @@ def _build_context_from_results(results: Sequence[Dict[str, Any]]) -> Tuple[str,
     return context, sources
 
 
+def _detect_program_type_from_year_label(value: Any) -> Optional[str]:
+    label = str(value or "").strip().lower()
+    if not label:
+        return None
+    if re.search(r"\b5(th)?\s*year\b", label) or "5year" in label or "five year" in label:
+        return "5year"
+    if re.search(r"\b4(th)?\s*year\b", label) or "4year" in label or "four year" in label:
+        return "4year"
+    return None
+
+
+def _normalize_program_type(value: Any) -> Optional[str]:
+    text = str(value or "").strip().lower().replace(" ", "").replace("-", "")
+    if not text:
+        return None
+    if text in {"5year", "5years", "fiveyear", "program5year", "year5"}:
+        return "5year"
+    if text in {"4year", "4years", "fouryear", "program4year", "year4"}:
+        return "4year"
+    if "5year" in text or "fiveyear" in text:
+        return "5year"
+    if "4year" in text or "fouryear" in text:
+        return "4year"
+    return None
+
+
+def _program_type_from_text(question: str) -> Optional[str]:
+    q = (question or "").lower()
+    if re.search(r"\b5\s*[- ]?year\b", q) or "fifth year" in q:
+        return "5year"
+    if re.search(r"\b4\s*[- ]?year\b", q) or "fourth year" in q:
+        return "4year"
+    return None
+
+
+def _resolve_program_type_for_rag(
+    *,
+    question: str,
+    current_user: Dict[str, Any],
+    user_context: Dict[str, Any],
+    domain_context: Dict[str, Any],
+) -> Optional[str]:
+    # 1) explicit mention in question has highest priority
+    from_question = _program_type_from_text(question)
+    if from_question:
+        return from_question
+
+    # 2) student/self claims from auth + profile + context
+    candidates = [
+        (current_user or {}).get("program_type"),
+        ((current_user or {}).get("student_profile") or {}).get("program_type"),
+        ((current_user or {}).get("students_progress") or {}).get("program_type"),
+        (user_context or {}).get("program_type"),
+    ]
+    for raw in candidates:
+        normalized = _normalize_program_type(raw)
+        if normalized:
+            return normalized
+
+    # 3) infer from current year labels where possible
+    year_candidates = [
+        ((current_user or {}).get("student_profile") or {}).get("current_year"),
+        (user_context or {}).get("current_year"),
+    ]
+    for raw in year_candidates:
+        inferred = _detect_program_type_from_year_label(raw)
+        if inferred:
+            return inferred
+
+    # 4) admin path: if realtime matched exactly one student, infer from that student
+    matched_students = (domain_context or {}).get("matched_students_realtime") or []
+    if isinstance(matched_students, list) and len(matched_students) == 1:
+        student = matched_students[0] or {}
+        normalized = _normalize_program_type(
+            ((student.get("student_profile") or {}).get("program_type"))
+            or student.get("program_type")
+        )
+        if normalized:
+            return normalized
+        inferred = _detect_program_type_from_year_label(
+            (student.get("student_profile") or {}).get("current_year")
+        )
+        if inferred:
+            return inferred
+
+    return None
+
+
 def _extract_text_from_gemini_response(data: Dict[str, Any]) -> str:
     """Extract assistant text from Gemini generateContent response."""
     candidates = data.get("candidates") or []
@@ -929,13 +1018,23 @@ async def chat_with_base_model(
     if _should_use_rag(intent) and int(settings.AI_RAG_K) > 0:
         embeddings = await embed_texts([question], task_type="RETRIEVAL_QUERY")
         query_embedding = embeddings[0]
-        metadata_filter = {"metadata.type": "announcements"} if intent == "announcements" else None
+        metadata_filter: Dict[str, Any] = {}
+        if intent == "announcements":
+            metadata_filter["metadata.type"] = "announcements"
+        program_type = _resolve_program_type_for_rag(
+            question=question,
+            current_user=current_user,
+            user_context=user_context,
+            domain_context=domain_context,
+        )
+        if program_type:
+            metadata_filter["metadata.program_type"] = program_type
         rag_results = await vector_search_knowledge(
             query_embedding=query_embedding,
             limit=settings.AI_RAG_K,
             num_candidates=settings.AI_RAG_NUM_CANDIDATES,
             score_threshold=settings.AI_RAG_SCORE_THRESHOLD,
-            metadata_filter=metadata_filter,
+            metadata_filter=metadata_filter or None,
         )
         rag_context, sources = _build_context_from_results(rag_results)
 
@@ -964,6 +1063,12 @@ async def chat_with_base_model(
             "response_mode": response_mode,
             "realtime_context_used": bool(realtime_context),
             "realtime_context_keys": list(realtime_context.keys())[:20] if realtime_context else [],
+            "rag_program_filter": _resolve_program_type_for_rag(
+                question=question,
+                current_user=current_user,
+                user_context=user_context,
+                domain_context=domain_context,
+            ),
         },
         hypothesis_id="H5",
     )

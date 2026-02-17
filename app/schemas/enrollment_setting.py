@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field, model_validator
 class EnrollmentSettingWrite(BaseModel):
     window_minutes: Optional[int] = Field(default=None, gt=0)
     window_days: Optional[int] = Field(default=None, gt=0)
-    max_credits: float = Field(default=18.0, gt=0)
+    max_credits: float = Field(default=24.0, gt=0)
     max_courses: Optional[int] = Field(default=None, gt=0)
     allow_waitlist: bool = False
     is_active: bool = True
