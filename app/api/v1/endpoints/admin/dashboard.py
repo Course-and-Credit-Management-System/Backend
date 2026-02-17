@@ -20,6 +20,26 @@ async def statistics(_admin=Depends(require_admin), service: AdminDashboardServi
 async def major_distribution(_admin=Depends(require_admin), service: AdminDashboardService = Depends(svc)):
     return await service.major_distribution()
 
+
+@router.get("/majors")
+async def list_majors(_admin=Depends(require_admin)):
+    """List all majors from DB for admin dropdowns."""
+    db = await get_database()
+    cols = await db.list_collection_names()
+    col_name = "Majors" if "Majors" in cols else ("majors" if "majors" in cols else None)
+    if not col_name:
+        return [{"id": "CS", "major_name": "CS"}, {"id": "CT", "major_name": "CT"}, {"id": "SE", "major_name": "SE"}, {"id": "KE", "major_name": "KE"}, {"id": "HPC", "major_name": "HPC"}, {"id": "CSec", "major_name": "CSec"}, {"id": "CN", "major_name": "CN"}, {"id": "BIS", "major_name": "BIS"}, {"id": "ES", "major_name": "ES"}]
+    col = db[col_name]
+    docs = await col.find({}).to_list(length=100)
+    out = []
+    for d in docs:
+        mid = d.get("_id") or d.get("id")
+        if str(mid).upper() == "HPT":
+            continue
+        name = d.get("major_name") or d.get("name") or str(mid)
+        out.append({"id": str(mid), "major_name": name})
+    return out if out else [{"id": "CS", "major_name": "CS"}, {"id": "CT", "major_name": "CT"}, {"id": "SE", "major_name": "SE"}, {"id": "KE", "major_name": "KE"}, {"id": "HPC", "major_name": "HPC"}, {"id": "CSec", "major_name": "CSec"}, {"id": "CN", "major_name": "CN"}, {"id": "BIS", "major_name": "BIS"}, {"id": "ES", "major_name": "ES"}]
+
 @router.get("/pending-actions")
 async def pending_actions(_admin=Depends(require_admin), service: AdminDashboardService = Depends(svc)):
     return await service.pending_actions()
