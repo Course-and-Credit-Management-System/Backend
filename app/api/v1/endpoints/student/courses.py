@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+﻿from fastapi import APIRouter, Depends, HTTPException, status, Query
 from fastapi.responses import StreamingResponse
 from typing import List, Dict, Any, Optional, Union
 from beanie.operators import In, Or, RegEx
@@ -34,12 +34,20 @@ _drop_ai_locks: Dict[str, asyncio.Lock] = {}
 
 def _detect_semester_parity(value: Any) -> str:
     norm = str(value or "").strip().lower()
-    if "first sem" in norm or "firstsem" in norm or "1st sem" in norm:
-        return "first"
-    if "second sem" in norm or "secondsem" in norm or "2nd sem" in norm:
+    # Check second-semester forms first to avoid matching "semester i" inside "semester ii".
+    if (
+        re.search(r"\bsecond\s*sem(?:ester)?\b", norm)
+        or re.search(r"\b2nd\s*sem(?:ester)?\b", norm)
+        or re.search(r"\bsem(?:ester)?\s*ii\b", norm)
+    ):
         return "second"
+    if (
+        re.search(r"\bfirst\s*sem(?:ester)?\b", norm)
+        or re.search(r"\b1st\s*sem(?:ester)?\b", norm)
+        or re.search(r"\bsem(?:ester)?\s*i\b", norm)
+    ):
+        return "first"
     return "unknown"
-
 
 def _detect_academic_year(value: Any) -> str:
     norm = str(value or "").strip().lower()
@@ -80,31 +88,32 @@ def _is_new_student(current_year: Any) -> bool:
     return _detect_semester_version(current_year) == "new"
 
 
+def _normalize_track_token(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    compact = re.sub(r"[^a-z]", "", raw)
+    if compact in {"cs", "computerscience"}:
+        return "cs"
+    if compact in {"ct", "computertechnology"}:
+        return "ct"
+    return compact
+
+
 def _parse_semester_label(value: Any) -> tuple[str, str, str]:
     """
-    Strict parser for labels like:
-    'New . 3rd Year. First Sem.'
-    'New • 3rd Year • First Sem'
-    Returns: (version, year, parity) or ('unknown','unknown','unknown') if format not matched.
+    Flexible parser for semester labels with dots, bullets, commas, or parentheses.
+    Returns: (version, year, parity), using "unknown" for missing parts.
     """
     raw = str(value or "").strip()
     if not raw:
         return ("unknown", "unknown", "unknown")
 
-    norm = raw.lower()
-    # strict separators with dot/bullet style; tolerate extra spaces and trailing dot.
-    m = re.match(
-        r"^\s*(new|old)\s*[\.•]\s*([1-9](?:st|nd|rd|th)\s*year)\s*[\.•]\s*(first|second)\s*sem\.?\s*$",
-        norm,
-    )
-    if not m:
-        return ("unknown", "unknown", "unknown")
-
-    version = m.group(1)
-    year = _detect_academic_year(m.group(2))
-    parity = "first" if m.group(3) == "first" else "second"
+    norm = raw.lower().replace("â€¢", "•")
+    version = _detect_semester_version(norm)
+    year = _detect_academic_year(norm)
+    parity = _detect_semester_parity(norm)
     return (version, year, parity)
-
 
 def _is_program_eligible_for_student(
     *,
@@ -115,40 +124,53 @@ def _is_program_eligible_for_student(
     course_track: str,
 ) -> bool:
     student_major = str(selected_major or "").strip().lower()
-    student_track = str(selected_track or "").strip().lower()
+    student_track = _normalize_track_token(selected_track)
     c_major = str(course_major or "").strip().lower()
-    c_track = str(course_track or "").strip().lower()
-
-    # Neutral course per requested rule: no major.
-    is_neutral_course = not c_major
-
-    if is_new_student:
-        if student_major:
-            return is_neutral_course or c_major == student_major
-        return True
+    c_track = _normalize_track_token(course_track)
+    is_neutral_course = not c_major and not c_track
 
     has_major = bool(student_major)
     has_track = bool(student_track)
 
-    if has_track and not has_major:
-        return is_neutral_course or c_track == student_track
-    if has_track and has_major:
-        return is_neutral_course or (c_major == student_major and c_track == student_track)
-    if not has_major and not has_track:
+    # Neutral courses are not restricted by major/track program matching.
+    if is_neutral_course:
         return True
 
-    # Fallback for partial profile data.
+    if is_new_student:
+        # New student ignores track completely.
+        if has_major:
+            # New + major => strict major match only.
+            return c_major == student_major
+        # New + no major => current logic (no program restriction).
+        return True
+
+    # Old student rules
+    if has_track and not has_major:
+        # Old + track only => same track, any major.
+        return c_track == student_track
+    if has_track and has_major:
+        # Old + track + major => both must match.
+        return c_track == student_track and c_major == student_major
+    if not has_major and not has_track:
+        # Old + neither => current logic (no program restriction).
+        return True
+
     return True
 
 
-def _course_matches_current_context(course: Any, current_year: Any) -> bool:
+def _course_matches_current_context(
+    course: Any,
+    current_year: Any,
+    *,
+    strict_year: bool = False,
+) -> bool:
     """A course is valid if any semester entry matches student's current year context."""
     semester_defs = getattr(course, "semester", None) or []
     if not semester_defs:
         return False
 
     user_version, user_year, user_parity = _parse_semester_label(current_year)
-    if "unknown" in {user_version, user_year, user_parity}:
+    if "unknown" in {user_version, user_parity}:
         return False
 
     for sem_def in semester_defs:
@@ -157,9 +179,15 @@ def _course_matches_current_context(course: Any, current_year: Any) -> bool:
         else:
             sem_name = sem_def
         sem_version, sem_year, sem_parity = _parse_semester_label(sem_name)
-        if (sem_version, sem_year, sem_parity) == (user_version, user_year, user_parity):
-            # OR logic across multiple semester entries: one match is enough.
-            return True
+        if strict_year:
+            if "unknown" in {user_year, sem_year}:
+                continue
+            if sem_version == user_version and sem_year == user_year and sem_parity == user_parity:
+                return True
+        else:
+            # Relaxed mode: year ignored.
+            if sem_version == user_version and sem_parity == user_parity:
+                return True
 
     return False
 
@@ -387,26 +415,29 @@ async def get_current_courses(current_user: Dict[str, Any] = Depends(get_current
     )
 
     def _build_progress_filter() -> Dict[str, Any]:
-        # Neutral = course has no major (track is ignored for neutrality).
         neutral_course_filter: Dict[str, Any] = {
             "$or": [{"major": {"$exists": False}}, {"major": None}, {"major": ""}]
         }
 
-        # New students ignore track constraints entirely.
+        # New students ignore track constraints.
         if is_new_student:
             if selected_major:
-                return {"$or": [neutral_course_filter, {"major": selected_major}]}
-            # No major for new students => semester-only
-            return {}
+                # New + major: strict major match.
+                return {"major": selected_major}
+            # New + no major: only neutral courses.
+            return neutral_course_filter
 
         # Old students:
-        # - track only => same track OR neutral(no major)
-        # - major + track => same major+track OR neutral(no major)
-        # - major only / neither => semester-only
+        # - track only => same track (major can be anything)
+        # - major + track => same major+track
+        # - major only => semester-only
+        # - neither => only neutral courses
         if selected_major and selected_track:
-            return {"$or": [neutral_course_filter, {"major": selected_major, "track": selected_track}]}
+            return {"major": selected_major, "track": selected_track}
         if selected_track:
-            return {"$or": [neutral_course_filter, {"track": selected_track}]}
+            return {"track": selected_track}
+        if not selected_major and not selected_track:
+            return neutral_course_filter
         return {}
 
     def _and_filters(*parts: Dict[str, Any]) -> Dict[str, Any]:
@@ -434,7 +465,11 @@ async def get_current_courses(current_user: Dict[str, Any] = Depends(get_current
     semester_courses = await Course.find(base_course_query).to_list()
     suitable_courses = [
         c for c in semester_courses
-        if c.course_code not in passed_codes and _course_matches_current_context(c, current_year_str)
+        if c.course_code not in passed_codes and _course_matches_current_context(
+            c,
+            current_year_str,
+            strict_year=True,
+        )
     ]
     
     # DEBUG: Check what user current year is used to match
@@ -479,7 +514,11 @@ async def get_current_courses(current_user: Dict[str, Any] = Depends(get_current
         retake_courses_raw = await Course.find(retake_query).to_list()
         retake_courses_objs = [
             c for c in retake_courses_raw
-            if c.course_code not in passed_codes and _course_matches_current_context(c, current_year_str)
+            if c.course_code not in passed_codes and _course_matches_current_context(
+                c,
+                current_year_str,
+                strict_year=True,
+            )
         ]
 
     # 2. Check for existing enrollments for this semester
@@ -499,14 +538,34 @@ async def get_current_courses(current_user: Dict[str, Any] = Depends(get_current
         }
     
     # 3. Auto-Enroll Logic
-    # Standard courses: Auto-enroll ONLY if zero enrollments exist (Fresh start).
-    # Retake courses: ALWAYS auto-enroll if missing (Mandatory).
+    # Refresh rule:
+    #  - Count current-semester enrollments for this student.
+    #  - Count eligible same-semester courses.
+    #  - If counts are equal -> skip standard auto-enroll.
+    #  - If counts differ -> auto-enroll missing standard courses.
+    # Retake courses remain mandatory and are still enforced.
     
     courses_to_process_map = {}
 
-    # 1. Add Standard Courses (Always ensure any missing eligible semester course is present)
-    for c in suitable_courses:
-        courses_to_process_map[c.course_code] = c
+    existing_active_codes = {
+        str(e.course_id or "").strip()
+        for e in enrollments
+        if (e.status != EnrollmentStatus.DROPPED and e.status != EnrollmentStatus.DROPPED.value)
+        and str(e.course_id or "").strip()
+    }
+    eligible_standard_codes = {str(c.course_code or "").strip() for c in suitable_courses if str(c.course_code or "").strip()}
+
+    needs_standard_auto_enroll = len(existing_active_codes) != len(eligible_standard_codes)
+    print(
+        f"DEBUG AUTO-ENROLL: enrolled_count={len(existing_active_codes)} "
+        f"eligible_semester_count={len(eligible_standard_codes)} "
+        f"needs_enroll={needs_standard_auto_enroll}"
+    )
+
+    # 1. Add Standard Courses only when count mismatch.
+    if needs_standard_auto_enroll:
+        for c in suitable_courses:
+            courses_to_process_map[c.course_code] = c
     
     # 2. Add Retake Courses (Always)
     # This ensures that even if user has other enrollments, a missing Retake is forced in.
@@ -544,19 +603,17 @@ async def get_current_courses(current_user: Dict[str, Any] = Depends(get_current
     # 4. Format response
     enrollments.sort(key=lambda x: x.is_retake, reverse=True)
 
-    enrolled_course_codes = [e.course_id for e in enrollments]
+    enrolled_course_codes = [
+        str(e.course_id or "").strip()
+        for e in enrollments
+        if str(e.course_id or "").strip()
+    ]
     course_lookup = {}
     if enrolled_course_codes:
-        response_courses_query: Dict[str, Any] = _and_filters(
-            {"course_code": {"$in": enrolled_course_codes}},
-            progress_filter,
-        )
-        courses_data_raw = await Course.find(response_courses_query).to_list()
-        courses_data = [
-            c for c in courses_data_raw
-            if c.course_code not in passed_codes and _course_matches_current_context(c, current_year_str)
-        ]
-        course_lookup = {c.course_code: c for c in courses_data}
+        # Important: current courses should always include courses already enrolled
+        # for this semester, even if they no longer match progress/context filters.
+        courses_data = await Course.find({"course_code": {"$in": enrolled_course_codes}}).to_list()
+        course_lookup = {str(c.course_code or "").strip(): c for c in courses_data}
     
     resp_courses = []
     total_credits = 0.0
@@ -636,61 +693,47 @@ def time_to_minutes(t_str: str) -> int:
         pass
     return 0
 
-def parse_schedule_slots(schedule: Optional[List[str]]):
+def parse_schedule_slots(schedule: Optional[Union[List[str], str]]):
     slots = []
-    if not schedule: return slots
-    
-    # Try different formats
-    # Format 1: "Mon/Wed 10:00 - 11:30"
-    # Format 2: "Monday 10:00-11:30"
-    
-    for s in schedule:
-        if not s: continue
-        s_clean = s.replace(" - ", "-").strip()
-        
-        # Split by spaces, trying to find the time part at the end
-        parts = s_clean.split(" ")
-        
-        # Look for time range pattern like HH:MM-HH:MM
-        time_part = None
-        days_part = None
-        
-        # Iterate backwards to find time
-        for i in range(len(parts) - 1, -1, -1):
-            p = parts[i]
-            if '-' in p and ':' in p:
-                time_part = p
-                # The rest before this is days
-                days_part = " ".join(parts[:i])
-                break
-        
-        if time_part and days_part:
-            try:
-                start_str, end_str = time_part.split('-')
-                start_min = time_to_minutes(start_str)
-                end_min = time_to_minutes(end_str)
-                
-                # Normalize days
-                # Handle "Mon/Wed", "Mon, Wed", "Monday"
-                # Simple normalization to 3 chars
-                
-                d_tokens = days_part.replace(',', ' ').replace('/', ' ').split()
-                for d in d_tokens:
-                    d = d.strip()
-                    if d:
-                        # normalize to first 3 chars title case if possible (Mon, Tue)
-                        # This ensures "Monday" matches "Mon"
-                        d_norm = d[:3].capitalize()
-                        slots.append((d_norm, start_min, end_min))
-            except:
-                print(f"DEBUG: Failed to parse schedule item: {s}")
-                pass
-        else:
-             # Fallback to my previous logic if spaces are messy "Mon 10:00 - 11:30"
-             # My previous logic relied on -2, -1.
-             # Let's try to extract time times using simple scan
-             pass
-             
+    if not schedule:
+        return slots
+
+    items = schedule if isinstance(schedule, list) else [schedule]
+    day_map = {
+        "mon": "Mon", "monday": "Mon",
+        "tue": "Tue", "tues": "Tue", "tuesday": "Tue",
+        "wed": "Wed", "wednesday": "Wed",
+        "thu": "Thu", "thur": "Thu", "thurs": "Thu", "thursday": "Thu",
+        "fri": "Fri", "friday": "Fri",
+        "sat": "Sat", "saturday": "Sat",
+        "sun": "Sun", "sunday": "Sun",
+    }
+
+    for raw in items:
+        s = str(raw or "").strip()
+        if not s:
+            continue
+
+        s_clean = s.replace("–", "-").replace("—", "-").replace(" - ", "-")
+        time_match = re.search(r"(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})", s_clean)
+        if not time_match:
+            continue
+
+        start_min = time_to_minutes(time_match.group(1))
+        end_min = time_to_minutes(time_match.group(2))
+        if start_min <= 0 or end_min <= 0 or start_min >= end_min:
+            continue
+
+        days_part = s_clean[:time_match.start()]
+        day_tokens = re.findall(
+            r"\b(mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b",
+            days_part.lower(),
+        )
+        for token in day_tokens:
+            day_norm = day_map.get(token)
+            if day_norm:
+                slots.append((day_norm, start_min, end_min))
+
     return slots
 
 def has_schedule_conflict(slots1, slots2) -> bool:
@@ -925,15 +968,46 @@ async def search_courses(
     is_new_student = _is_new_student(user_current_year_str)
 
     progress_doc = current_user.get("students_progress") or {}
+    if not isinstance(progress_doc, dict):
+        progress_doc = {}
     if not progress_doc:
         db = await get_database()
         progress_col = await _get_col(db, ["students_progress", "StudentsProgress"])
-        progress_doc = await progress_col.find_one({"student_id": current_user.get("user_id")}) or {}
-    selected_major = str(progress_doc.get("selected_major") or "").strip()
-    selected_track = str(progress_doc.get("selected_track") or "").strip()
+        user_id_value = str(current_user.get("user_id") or "").strip()
+        email_value = str(current_user.get("email") or "").strip()
+        progress_matchers = []
+        if user_id_value:
+            progress_matchers.extend(
+                [
+                    {"student_id": user_id_value},
+                    {"user_id": user_id_value},
+                    {"student_user_id": user_id_value},
+                    {"studentId": user_id_value},
+                    {"userId": user_id_value},
+                ]
+            )
+        if email_value:
+            progress_matchers.append({"email": email_value})
+        progress_doc = await progress_col.find_one({"$or": progress_matchers}) if progress_matchers else {}
+        progress_doc = progress_doc or {}
+    selected_major = str(
+        progress_doc.get("selected_major")
+        or progress_doc.get("major")
+        or current_user.get("selected_major")
+        or current_user.get("major")
+        or ""
+    ).strip()
+    selected_track = str(
+        progress_doc.get("selected_track")
+        or progress_doc.get("track")
+        or progress_doc.get("selectedTrack")
+        or current_user.get("selected_track")
+        or current_user.get("track")
+        or ""
+    ).strip()
     # Course major/track may not be part of the typed model in all datasets.
     course_meta_map: Dict[str, Dict[str, str]] = {}
-    if selected_major or selected_track:
+    if selected_major or selected_track or wants_cs_only or wants_ct_only:
         db = await get_database()
         courses_col = await _get_col(db, ["Courses", "courses"])
         raw_courses = await courses_col.find({}, {"course_code": 1, "major": 1, "track": 1}).to_list(None)
@@ -979,6 +1053,7 @@ async def search_courses(
     
     active_course_ids = {str(e.course_id or "").strip() for e in active_enrollments if e.course_id}
     enrolled_course_ids = set()
+    pending_course_ids = set()
     for e in active_enrollments:
         status_val = getattr(e, "status", "")
         if hasattr(status_val, "value"):
@@ -990,6 +1065,10 @@ async def search_courses(
             code = str(getattr(e, "course_id", "") or "").strip()
             if code:
                 enrolled_course_ids.add(code)
+        elif status_text == "pending":
+            code = str(getattr(e, "course_id", "") or "").strip()
+            if code:
+                pending_course_ids.add(code)
     course_map = {c.course_code: c for c in courses}
     
     busy_slots = []
@@ -1006,12 +1085,36 @@ async def search_courses(
     response_data = []
 
     for course in courses:
+        semester_values = []
+        for sem_def in (course.semester or []):
+            if isinstance(sem_def, dict):
+                sem_name = str(sem_def.get("semester") or "").strip()
+            else:
+                sem_name = str(sem_def or "").strip()
+            if sem_name:
+                semester_values.append(sem_name)
+
+        # Skip courses that have no semester definitions at all.
+        # They should not be considered enrollable nor shown in normal search.
+        if not semester_values:
+            continue
+
         # A. Check validity against current student semester context.
         valid_context = True
         context_message = None
         if not _course_matches_current_context(course, user_current_year_str):
             valid_context = False
             context_message = "this course has been closed"
+            user_version, _, _ = _parse_semester_label(user_current_year_str)
+            course_versions = set()
+            for sem_name in semester_values:
+                sem_version, _, _ = _parse_semester_label(sem_name)
+                if sem_version in {"old", "new"}:
+                    course_versions.add(sem_version)
+            if user_version == "new" and course_versions and course_versions <= {"old"}:
+                context_message = "this course is for old student."
+            elif user_version == "old" and course_versions and course_versions <= {"new"}:
+                context_message = "this course is for new student."
 
         # B. Check prerequisites
         missing_prereqs = []
@@ -1040,8 +1143,9 @@ async def search_courses(
             or getattr(course, "track", "")
             or ""
         ).strip()
-        track_sort_priority = {"CS": 0, "CT": 1}
-        sort_index = track_sort_priority.get(course_track.upper(), 99)
+        course_track_norm = _normalize_track_token(course_track)
+        track_sort_priority = {"cs": 0, "ct": 1}
+        sort_index = track_sort_priority.get(course_track_norm, 99)
 
         is_program_eligible = _is_program_eligible_for_student(
             is_new_student=is_new_student,
@@ -1052,13 +1156,15 @@ async def search_courses(
         )
 
         has_program_mismatch = not is_program_eligible
-        is_currently_enrolled = str(course.course_code or "").strip() in enrolled_course_ids
+        course_code_str = str(course.course_code or "").strip()
+        is_currently_enrolled = course_code_str in enrolled_course_ids
+        is_pending = course_code_str in pending_course_ids
         
         error_msg = None
         status_str = "normal"
         
         # Priority Logic: Context > Prereq
-        if is_currently_enrolled:
+        if is_currently_enrolled or is_pending:
             status_str = "locked"
         elif not valid_context:
             status_str = "locked"
@@ -1075,19 +1181,13 @@ async def search_courses(
         
         # Get schedule string
         sched = course.schedule[0] if course.schedule else None
-        semester_values = []
-        for sem_def in (course.semester or []):
-            if isinstance(sem_def, dict):
-                sem_name = str(sem_def.get("semester") or "").strip()
-            else:
-                sem_name = str(sem_def or "").strip()
-            if sem_name:
-                semester_values.append(sem_name)
 
         # Message Logic
         message_str = None
         if is_currently_enrolled:
              message_str = "you are currently enrolling."
+        elif is_pending:
+             message_str = "your enrollment is pending approval."
         elif already_taken:
              message_str = "this course have been completed."
         elif not valid_context:
@@ -1111,7 +1211,7 @@ async def search_courses(
             type=c_type,
             credits=course.credits,
             semester=semester_values,
-            track=course_track or None,
+            track=(course_track or (course_track_norm.upper() if course_track_norm else None)),
             sort_index=sort_index,
             desc=course.description,
             color=get_course_color(c_type),
@@ -1124,10 +1224,10 @@ async def search_courses(
         ))
     
     if wants_cs_only:
-        response_data = [item for item in response_data if (item.track or "").upper() == "CS"]
+        response_data = [item for item in response_data if _normalize_track_token(item.track) == "cs"]
 
     if wants_ct_only:
-        response_data = [item for item in response_data if (item.track or "").upper() == "CT"]
+        response_data = [item for item in response_data if _normalize_track_token(item.track) == "ct"]
 
     if wants_major_only:
         response_data = [item for item in response_data if item.type.lower() == "major"]
@@ -1627,3 +1727,4 @@ async def finalize_enrollment(
             "successful_enrollments": successful_enrollments,
         }
     )
+
