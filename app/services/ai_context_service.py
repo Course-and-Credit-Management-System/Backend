@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import json
 import re
@@ -18,6 +18,40 @@ async def _get_collection(possible_names: List[str]):
         if name in names:
             return db[name]
     return db[possible_names[0]]
+
+
+def _normalize_major_value(value: Any) -> Optional[str]:
+    major_id = str(value or "").strip()
+    return major_id or None
+
+
+async def _resolve_student_major_id(
+    user_id: str,
+    user_doc: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve student's major with fallback to `students_progress.selected_major`."""
+    if not user_id:
+        return None, None
+
+    user = user_doc
+    if user is None:
+        users = await _get_collection(["Users", "users"])
+        user = await users.find_one({"user_id": user_id}, {"student_profile.major_id": 1})
+
+    major_from_profile = _normalize_major_value(((user or {}).get("student_profile") or {}).get("major_id"))
+    if major_from_profile:
+        return major_from_profile, "student_profile.major_id"
+
+    progress_col = await _get_collection(["students_progress", "StudentsProgress"])
+    progress = await progress_col.find_one(
+        {"student_id": user_id},
+        {"selected_major": 1},
+    )
+    major_from_progress = _normalize_major_value((progress or {}).get("selected_major"))
+    if major_from_progress:
+        return major_from_progress, "students_progress.selected_major"
+
+    return None, None
 
 
 def enforce_context_scope(current_user: Dict[str, Any], requested_context_type: str) -> bool:
@@ -63,11 +97,13 @@ async def _build_student_user_context(user_id: str) -> Dict[str, Any]:
         return {}
 
     student_profile = user.get("student_profile") or {}
+    resolved_major_id, major_source = await _resolve_student_major_id(user_id=user_id, user_doc=user)
     return {
         "user_id": user.get("user_id"),
         "name": user.get("name"),
         "role": user.get("role"),
-        "major_id": student_profile.get("major_id"),
+        "major_id": resolved_major_id,
+        "major_source": major_source,
         "academic_status": student_profile.get("academic_status"),
         "current_year": student_profile.get("current_year"),
         "gpa": student_profile.get("gpa"),
@@ -474,7 +510,6 @@ async def _build_course_advisor_context(
             {"user_id": student_id},
             {"student_profile": 1, "academic_history": 1, "_id": 0},
         )
-        student_profile = (user or {}).get("student_profile") or {}
         history = (user or {}).get("academic_history") or []
 
         completed_codes = {
@@ -487,7 +522,7 @@ async def _build_course_advisor_context(
         prerequisites = [str(p).strip() for p in (course.get("prerequisites") or []) if str(p).strip()]
         missing_prerequisites = [p for p in prerequisites if p not in completed_codes]
         major_specific = bool(course.get("major_specific"))
-        major_id = student_profile.get("major_id")
+        major_id, _ = await _resolve_student_major_id(user_id=student_id, user_doc=user)
         major_match = True if not major_specific else bool(major_id)
         fit_reasons: List[str] = []
         if missing_prerequisites:
@@ -550,19 +585,25 @@ async def _build_major_requirement_courses_context(current_user: Dict[str, Any])
     if role != "student":
         return {}
 
-    users = await _get_collection(["Users", "users"])
     majors = await _get_collection(["Majors", "majors"])
     courses = await _get_collection(["Courses", "courses"])
-
-    user = await users.find_one({"user_id": current_user.get("user_id")}, {"student_profile.major_id": 1})
-    major_id = ((user or {}).get("student_profile") or {}).get("major_id")
+    major_id, major_source = await _resolve_student_major_id(user_id=str(current_user.get("user_id") or ""))
     if not major_id:
         return {"major_requirement_courses": []}
 
     major = await majors.find_one({"_id": major_id}, {"_id": 1, "major_name": 1, "requirements": 1})
     requirements = (major or {}).get("requirements") or []
     if not requirements:
-        return {"major_requirement_courses": [], "major_requirement_summary": {"required_count": 0, "mapped_count": 0}}
+        return {
+            "major_requirement_courses": [],
+            "major_requirement_summary": {
+                "major_id": major_id,
+                "major_source": major_source,
+                "major_name": (major or {}).get("major_name"),
+                "required_count": 0,
+                "mapped_count": 0,
+            },
+        }
 
     course_docs = await courses.find(
         {"course_code": {"$in": requirements}},
@@ -574,6 +615,7 @@ async def _build_major_requirement_courses_context(current_user: Dict[str, Any])
     return {
         "major_requirement_summary": {
             "major_id": major_id,
+            "major_source": major_source,
             "major_name": (major or {}).get("major_name"),
             "required_count": len(requirements),
             "mapped_count": len(course_docs),
@@ -586,17 +628,17 @@ async def _build_major_context(current_user: Dict[str, Any]) -> Dict[str, Any]:
     if not enforce_context_scope(current_user, "majors"):
         return {}
 
-    users = await _get_collection(["Users", "users"])
     majors = await _get_collection(["Majors", "majors"])
     role = (current_user.get("role") or "").lower()
 
     if role == "student":
-        user = await users.find_one({"user_id": current_user.get("user_id")}, {"student_profile.major_id": 1})
-        major_id = ((user or {}).get("student_profile") or {}).get("major_id")
+        major_id, _ = await _resolve_student_major_id(user_id=str(current_user.get("user_id") or ""))
         if not major_id:
             return {"major": None}
         major = await majors.find_one({"_id": major_id}, {"_id": 1, "major_name": 1, "department": 1, "requirements": 1})
-        return {"major": major}
+        if major:
+            return {"major": major}
+        return {"major": {"_id": major_id, "major_name": None, "department": None, "requirements": []}}
 
     major_list = await majors.find({}, {"_id": 1, "major_name": 1, "department": 1}).to_list(length=50)
     return {"majors": major_list}

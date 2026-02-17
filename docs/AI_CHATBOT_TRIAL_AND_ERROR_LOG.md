@@ -1,17 +1,19 @@
-# AI Chatbot Trial-and-Error Log
+# Backend AI & Enrollment Trial-and-Error Log
 
 ## Purpose
-Track what was tried, what worked, what failed, and why for AI chatbot development.  
+Track what was tried, what worked, what failed, and why for backend AI and enrollment behavior changes.  
 This prevents repeating the same mistakes and makes future tuning faster.
 
 ## Is This Necessary?
-Yes, for this project it is necessary to keep this log because chatbot behavior depends on prompts, mode routing, context building, and provider reliability.
+Yes, for this project it is necessary to keep this log because both AI behavior and enrollment filtering depend on prompt/mode logic, context assembly, and DB-backed business rules.
 
 Use this log when you change:
 - Chat routes or request/response schema
 - Mode classification or mode-specific behavior
 - Prompt/context assembly logic
 - Retrieval strategy, model settings, retry behavior, or rate-limit handling
+- Student course filtering/enrollability rules
+- Major/track eligibility behavior tied to `students_progress`
 
 ## Current Architecture Snapshot
 - API routes:
@@ -231,12 +233,124 @@ Copy this block for each trial:
 - Next step:
   - Ensure frontend renders timestamps without unintended client-side timezone shifts
 
+### Experiment ID: EXP-0008
+- Date: 2026-02-16
+- Owner: Backend team
+- Goal: Fix `/api/v1/student/courses/current` course selection rules for semester + major/track + neutral(common) courses
+- Hypothesis: Enrollment dashboard becomes correct when eligibility combines:
+  - same semester
+  - selected major/track rules from `students_progress`
+  - neutral courses (no `major` and no `track`)
+  - exclusion of already passed/completed history
+- Change:
+  - Updated `app/api/v1/endpoints/student/courses.py` (`GET /student/courses/current`)
+  - Added `students_progress`-based filtering:
+    - major+track: match both
+    - major only: match major
+    - track only: match track
+    - always include neutral/common courses (missing/null/empty `major` and `track`)
+  - Kept strict same-semester condition (`semester.semester == student_profile.current_year`)
+  - Excluded passed/completed courses using `academic_history` + Enrollment passed/completed statuses
+  - Changed auto-enroll behavior to ensure missing eligible semester courses are added even when enrollments already exist
+- Data/Prompt/Mode used:
+  - N/A (non-chatbot endpoint behavior)
+- Result:
+  - Quality: Correct current-course list for mixed curriculum (major-specific + common/core semester courses)
+  - Latency: Small additional filtering/query overhead, no expected major regression
+  - Reliability: Reduced false inclusion/exclusion from earlier conditional logic
+- Decision: Keep
+- Notes:
+  - Earlier edits on `student/academic.py` were reverted because response payload source was `student/courses.py`
+  - Canonical schema reference: `.github/skills/data-schemas/SKILL.md`
+- Next step:
+  - Add integration tests for:
+    - major only
+    - track only
+    - major+track
+    - neutral course inclusion
+    - passed-history exclusion
+
+### Experiment ID: EXP-0009
+- Date: 2026-02-16
+- Owner: Backend team
+- Goal: Add major filter tokens for `GET /api/v1/student/courses`
+- Hypothesis: Allowing `sort=major` and combined `sort=major,enrollable` will reduce frontend-side filtering and ambiguity.
+- Change:
+  - Updated `app/api/v1/endpoints/student/courses.py` (`GET /student/courses`)
+  - `sort` now supports comma-separated tokens:
+    - `major`
+    - `enrollable`
+    - combined `major,enrollable` (or reversed order)
+  - Added aliases `type:major` and `course_type:major` for compatibility.
+- Data/Prompt/Mode used:
+  - N/A (non-chatbot endpoint behavior)
+- Result:
+  - Quality: Endpoint can now return major-only and major+enrollable subsets directly.
+  - Latency: No material impact (in-memory filter over existing response list).
+  - Reliability: Backward compatibility kept for existing `sort=enrollable`.
+- Decision: Keep
+- Notes:
+  - Filtered responses are sorted by `code` for deterministic output.
+- Next step:
+  - Add endpoint tests for `sort=major`, `sort=enrollable`, and `sort=major,enrollable`.
+
+### Experiment ID: EXP-0010
+- Date: 2026-02-16
+- Owner: Backend team
+- Goal: Enforce `selected_major` compatibility for enrollable Major courses
+- Hypothesis: For students with `selected_major`, major-type courses from other majors should never appear enrollable.
+- Change:
+  - Updated `app/api/v1/endpoints/student/courses.py` (`GET /student/courses`)
+  - During course search, load student's `selected_major` from `students_progress`
+  - Added major-compatibility check in enrollability flow:
+    - If `course.type == "Major"` and course `major` is present but differs from student `selected_major`, mark as locked/non-enrollable
+- Data/Prompt/Mode used:
+  - N/A (non-chatbot endpoint behavior)
+- Result:
+  - Quality: `sort=enrollable` now excludes major courses that belong to another major.
+  - Latency: Minor overhead from raw major lookup map build.
+  - Reliability: Existing prerequisite/context/conflict logic remains unchanged.
+- Decision: Keep
+- Notes:
+  - Rule applies only when student has `selected_major`; otherwise previous behavior remains.
+- Next step:
+  - Add regression tests for:
+    - student with `selected_major` + cross-major major-type course
+    - student with no `selected_major`
+
+### Experiment ID: EXP-0011
+- Date: 2026-02-16
+- Owner: Backend team
+- Goal: Finalize combined filter semantics for major/enrollable search
+- Hypothesis: Accepting common client token formats while enforcing strict AND semantics reduces integration mistakes.
+- Change:
+  - Updated `app/api/v1/endpoints/student/courses.py` (`GET /student/courses`)
+  - `sort` token parser now accepts both `,` and `|` separators
+  - Added `enrollment` as alias for `enrollable`
+  - Combined filter semantics confirmed as intersection:
+    - `major + enrollable` => `type == "Major"` AND `enrollable == true`
+  - Confirmed fallback behavior:
+    - If student has no `selected_major`, major-name mismatch filtering is not applied
+- Data/Prompt/Mode used:
+  - N/A (non-chatbot endpoint behavior)
+- Result:
+  - Quality: Client can send `major,enrollable` or `major|enrollment` and receive identical intended output.
+  - Latency: No material impact.
+  - Reliability: Maintains backward compatibility with previous `sort=enrollable`.
+- Decision: Keep
+- Notes:
+  - Canonical meaning for combined major/enrollable is strict AND, not OR.
+- Next step:
+  - Add endpoint tests for token separators and alias handling.
+
 ## Failure/Issue Log
 Use this table for real incidents and regressions.
 
 | Date | ID | Symptom | Root Cause | Fix | Preventive Action |
 |---|---|---|---|---|---|
 | 2026-02-14 | INC-0001 | Chat payload drift across routes | Extra optional fields in request body | Standardized request schema | Add schema contract check in CI |
+| 2026-02-16 | INC-0002 | `/student/courses/current` returned cross-major courses | Eligibility initially checked on wrong endpoint and lacked final filter coupling in active flow | Moved/kept logic in `student/courses.py` and tied to `students_progress` + semester | Add endpoint ownership note in docs and regression tests for route path |
+| 2026-02-16 | INC-0003 | Expected common semester core course not shown when student already had enrollments | Standard courses were only auto-added on "fresh start" (`if not existing_course_ids`) | Always add missing eligible semester courses, then dedupe by existing enrollments | Add regression test for partial-existing-enrollment scenario |
 
 ## Known Risks
 - Admin context size can grow too large as student records increase.
