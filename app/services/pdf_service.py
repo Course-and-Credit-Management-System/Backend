@@ -4,6 +4,8 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch, cm
 from io import BytesIO
+from datetime import datetime
+from typing import Any
 import os
 from pathlib import Path
 from app.schemas.student import CertificateData, CompleteAcademicRecord
@@ -362,6 +364,153 @@ def generate_complete_transcript_pdf(data: CompleteAcademicRecord) -> BytesIO:
         ('FONTSIZE', (0,0), (-1,-1), 10),
     ]))
     elements.append(sig_table)
+
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer
+
+
+def generate_current_courses_pdf(payload: dict[str, Any]) -> BytesIO:
+    """Generate current semester course schedule PDF."""
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        topMargin=0.5 * inch,
+        bottomMargin=0.5 * inch,
+        leftMargin=0.5 * inch,
+        rightMargin=0.5 * inch,
+    )
+    elements = []
+    styles = getSampleStyleSheet()
+
+    header_style = ParagraphStyle(
+        "Header",
+        parent=styles["Normal"],
+        fontSize=12,
+        leading=16,
+        alignment=1,
+        fontName="Helvetica-Bold",
+    )
+
+    default_logo = Path(__file__).resolve().parent.parent / "assets" / "uit_logo.png"
+    logo_path = os.getenv("CERT_LOGO_PATH", str(default_logo))
+    logo_img = None
+    try:
+        if os.path.exists(logo_path):
+            logo_img = Image(logo_path, width=1.2 * inch, height=1.2 * inch)
+    except Exception:
+        logo_img = None
+
+    header_text = """
+    REPUBLIC OF THE UNION OF MYANMAR<br/>
+    MINISTRY OF SCIENCE AND TECHNOLOGY<br/>
+    <font size=14>UNIVERSITY OF INFORMATION TECHNOLOGY</font><br/>
+    Universities' Hlaing Campus, Ward (12), Parami Road,<br/>
+    Hlaing Township, P.O. 11051, Yangon, Myanmar.
+    """
+    if logo_img:
+        header_table = Table([[logo_img, Paragraph(header_text, header_style)]], colWidths=[1.4 * inch, 6.0 * inch])
+        header_table.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("ALIGN", (0, 0), (0, 0), "LEFT"),
+            ("ALIGN", (1, 0), (1, 0), "CENTER"),
+        ]))
+        elements.append(header_table)
+    else:
+        elements.append(Paragraph(header_text, header_style))
+
+    elements.append(Spacer(1, 0.2 * inch))
+    elements.append(Paragraph("<b><u>CURRENT SEMESTER COURSE SCHEDULE</u></b>", header_style))
+    elements.append(Spacer(1, 0.18 * inch))
+
+    student = payload.get("student", {})
+    schedule = payload.get("schedule", {})
+    generated_at = payload.get("generated_at") or datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    info_data = [
+        ["Student Name", f": {student.get('name') or 'N/A'}"],
+        ["Student ID", f": {student.get('user_id') or 'N/A'}"],
+        ["Program / Year", f": {student.get('current_year') or 'N/A'}"],
+        ["Semester", f": {schedule.get('semester_name') or 'Current Semester'}"],
+        ["Generated At", f": {generated_at}"],
+    ]
+    info_table = Table(info_data, colWidths=[1.8 * inch, 4.9 * inch])
+    info_table.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"),
+        ("FONTNAME", (1, 0), (1, -1), "Helvetica"),
+        ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]))
+    elements.append(info_table)
+    elements.append(Spacer(1, 0.18 * inch))
+
+    courses = schedule.get("courses") or []
+    subject_style = ParagraphStyle("Subject", parent=styles["Normal"], fontSize=10, leading=12, alignment=0)
+    subject_style.wordWrap = "CJK"
+    meta_style = ParagraphStyle("Meta", parent=styles["Normal"], fontSize=9, leading=11, textColor=colors.grey)
+
+    table_data = [["Course Code", "Course Title", "Credits", "Instructor", "Room", "Retake"]]
+    if courses:
+        for course in courses:
+            table_data.append([
+                str(course.get("code") or "N/A"),
+                Paragraph(str(course.get("title") or "Untitled Course"), subject_style),
+                f"{float(course.get('credits') or 0):g}",
+                Paragraph(str(course.get("instructor") or "TBA"), meta_style),
+                str(course.get("location") or "TBA"),
+                "Yes" if bool(course.get("is_retake")) else "No",
+            ])
+    else:
+        table_data.append([
+            "-",
+            Paragraph("No active courses found for the current semester.", subject_style),
+            "-",
+            "-",
+            "-",
+            "-",
+        ])
+
+    course_table = Table(
+        table_data,
+        colWidths=[1.05 * inch, 2.8 * inch, 0.7 * inch, 1.2 * inch, 0.7 * inch, 0.65 * inch],
+    )
+    course_table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 1, colors.black),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("ALIGN", (1, 1), (1, -1), "LEFT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    elements.append(course_table)
+    elements.append(Spacer(1, 0.2 * inch))
+
+    total_credits = float(schedule.get("total_credits") or 0)
+    max_credits = float(schedule.get("max_credits") or 0)
+    remaining = max(max_credits - total_credits, 0.0)
+    summary_data = [
+        ["Total Registered Courses", str(schedule.get("courses_count") or 0)],
+        ["Total Credits", f"{total_credits:g}"],
+        ["Maximum Allowed Credits", f"{max_credits:g}"],
+        ["Remaining Credit Capacity", f"{remaining:g}"],
+    ]
+    summary_table = Table(summary_data, colWidths=[2.6 * inch, 1.5 * inch])
+    summary_table.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"),
+        ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+        ("BACKGROUND", (0, 0), (-1, -1), colors.lightgrey),
+        ("GRID", (0, 0), (-1, -1), 1, colors.black),
+    ]))
+    elements.append(summary_table)
+    elements.append(Spacer(1, 0.3 * inch))
+
+    footer = (
+        "This schedule is generated from the current enrollment records maintained by the "
+        "Student Affairs Department, University of Information Technology."
+    )
+    elements.append(Paragraph(footer, styles["Normal"]))
 
     doc.build(elements)
     buffer.seek(0)
