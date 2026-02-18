@@ -148,12 +148,12 @@ async def save_academic_year(payload: dict, current_user=Depends(get_current_use
         },
         upsert=True,
     )
-    if not existing_norm:
-        to_store = _normalize_ay(profile.get("admission_academic_year", "")) or _normalize_ay(academic_year)
-        await users.update_one(
-            {"user_id": current_user["user_id"]},
-            {"$set": {"student_profile.admission_academic_year": to_store}}
-        )
+    # Persist normalized admission year and program duration in Users profile for tracing old/new
+    to_store = _normalize_ay(profile.get("admission_academic_year", "")) or _normalize_ay(academic_year)
+    await users.update_one(
+        {"user_id": current_user["user_id"]},
+        {"$set": {"student_profile.admission_academic_year": to_store, "student_profile.program_duration": program_type}}
+    )
     return {"program_type": program_type, "program_rule_note": rule_note}
 
 @router.post("/progress/current", tags=["student"])
@@ -180,7 +180,8 @@ async def save_current(payload: dict, current_user=Depends(get_current_user)):
     udoc = await users.find_one({"user_id": current_user["user_id"]})
     profile = (udoc or {}).get("student_profile") or {}
     prof_yr, prof_sem, prof_pt = _parse_profile_current(profile.get("current_year"))
-    if prof_pt and not program_type:
+    # Prefer explicit old/new hint from Users over derived fallback
+    if prof_pt:
         program_type = prof_pt
     if prof_yr and prof_yr != current_year:
         raise HTTPException(status_code=409, detail=f"Current year does not match our records (expected {prof_yr}). Please enter the real year and semester.")

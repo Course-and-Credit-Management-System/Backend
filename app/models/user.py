@@ -22,7 +22,9 @@ class MajorHistory(BaseModel):
     major_id: str
 
 class StudentProfile(BaseModel):
-    major_id: str
+    major_id: Optional[str] = None
+    major_track: Optional[str] = None
+    program_duration: Optional[str] = None  # "4-year" | "5-year"
     academic_status: AcademicStatus = AcademicStatus.ACTIVE
     total_credits: int = 0
     section: Optional[str] = None  # A, B, C for years 1-3
