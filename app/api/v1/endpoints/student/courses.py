@@ -19,6 +19,7 @@ from app.services.ai_chat_service import (
 from pydantic import BaseModel, Field
 import asyncio
 import json
+import logging
 import re
 import uuid
 import time
@@ -26,6 +27,7 @@ from datetime import datetime
 from app.services.pdf_service import generate_current_courses_pdf
 
 router = APIRouter(prefix="/student/courses", tags=["student-courses"])
+logger = logging.getLogger(__name__)
 _DROP_AI_CACHE_TTL_SECONDS = 120
 _DROP_AI_COOLDOWN_SECONDS = 20
 _drop_ai_plan_cache: Dict[str, Dict[str, Any]] = {}
@@ -115,11 +117,73 @@ def _parse_semester_label(value: Any) -> tuple[str, str, str]:
     parity = _detect_semester_parity(norm)
     return (version, year, parity)
 
+
+def _is_major_course_type(course_type: Any) -> bool:
+    if hasattr(course_type, "value"):
+        course_type = getattr(course_type, "value")
+    return str(course_type or "").strip().lower() == "major"
+
+
+def _has_track_course_tag(course_track: Any) -> bool:
+    return bool(str(course_track or "").strip())
+
+
+def _is_course_allowed_for_year_rules(
+    *,
+    current_year: Any,
+    course_type: Any,
+    course_track: Any,
+) -> bool:
+    version, year, _ = _parse_semester_label(current_year)
+    is_major_course = _is_major_course_type(course_type)
+    has_track_tag = _has_track_course_tag(course_track)
+
+    if version == "new" and year in {"1", "2"}:
+        return not is_major_course
+
+    if version == "old" and year in {"1", "2"}:
+        return (not is_major_course) and (not has_track_tag)
+
+    if version == "old" and year == "3":
+        return True
+
+    return True
+
+
+def _build_year_rule_filter(current_year: Any) -> Dict[str, Any]:
+    version, year, _ = _parse_semester_label(current_year)
+    no_track_filter: Dict[str, Any] = {
+        "$or": [{"track": {"$exists": False}}, {"track": None}, {"track": ""}]
+    }
+
+    if version == "new" and year in {"1", "2"}:
+        return {"type": {"$ne": "Major"}}
+    if version == "old" and year in {"1", "2"}:
+        return {"$and": [{"type": {"$ne": "Major"}}, no_track_filter]}
+    if version == "old" and year == "3":
+        return {}
+
+    return {}
+
+
+def _skip_program_match_for_year(current_year: Any) -> bool:
+    version, year, _ = _parse_semester_label(current_year)
+    # Lower-year cohorts should be filtered only by year-rule restrictions,
+    # not by selected major/track matching.
+    if version == "new" and year in {"1", "2"}:
+        return True
+    if version == "old" and year in {"1", "2"}:
+        return True
+    return False
+
+
 def _is_program_eligible_for_student(
     *,
+    current_year: Any,
     is_new_student: bool,
     selected_major: str,
     selected_track: str,
+    course_type: Any,
     course_major: str,
     course_track: str,
 ) -> bool:
@@ -131,17 +195,29 @@ def _is_program_eligible_for_student(
 
     has_major = bool(student_major)
     has_track = bool(student_track)
+    version, year, _ = _parse_semester_label(current_year)
 
     # Neutral courses are not restricted by major/track program matching.
     if is_neutral_course:
         return True
 
     if is_new_student:
-        # New student ignores track completely.
+        # New + major + track:
+        # if course major is missing in dataset, fallback to track match.
+        if has_major and has_track:
+            if c_major:
+                return c_major == student_major
+            return c_track == student_track
+        # New + major => strict major match only.
         if has_major:
-            # New + major => strict major match only.
             return c_major == student_major
         # New + no major => current logic (no program restriction).
+        return True
+
+    # Old 3rd Year: enforce track-matching behavior.
+    if version == "old" and year == "3":
+        if has_track:
+            return c_track == student_track
         return True
 
     # Old student rules
@@ -401,11 +477,15 @@ async def get_current_courses(current_user: Dict[str, Any] = Depends(get_current
     is_new_student = _is_new_student(current_year_str)
     effective_settings = await get_effective_enrollment_settings_for_user(current_user=current_user)
 
-    progress_doc = current_user.get("students_progress") or {}
-    if not progress_doc:
-        db = await get_database()
-        progress_col = await _get_col(db, ["students_progress", "StudentsProgress"])
-        progress_doc = await progress_col.find_one({"student_id": current_user["user_id"]}) or {}
+    # Always refresh progress from DB for current-courses logic.
+    # This avoids stale session-embedded students_progress causing wrong-track results.
+    db = await get_database()
+    progress_col = await _get_col(db, ["students_progress", "StudentsProgress"])
+    db_progress = await progress_col.find_one(
+        {"$or": [{"student_id": current_user["user_id"]}, {"user_id": current_user["user_id"]}]}
+    ) or {}
+    progress_doc = db_progress or (current_user.get("students_progress") or {})
+
     selected_major = str(progress_doc.get("selected_major") or "").strip()
     selected_track = str(progress_doc.get("selected_track") or "").strip()
 
@@ -416,28 +496,41 @@ async def get_current_courses(current_user: Dict[str, Any] = Depends(get_current
 
     def _build_progress_filter() -> Dict[str, Any]:
         neutral_course_filter: Dict[str, Any] = {
-            "$or": [{"major": {"$exists": False}}, {"major": None}, {"major": ""}]
+            "$and": [
+                {"$or": [{"major": {"$exists": False}}, {"major": None}, {"major": ""}]},
+                {"$or": [{"track": {"$exists": False}}, {"track": None}, {"track": ""}]},
+            ]
         }
+        user_version, user_year, _ = _parse_semester_label(current_year_str)
+        # OLD student current-courses rules (year-based):
+        # 1st/2nd year: same semester only (no major/track filter).
+        # 3rd year: neutral OR same track.
+        # 4th/5th year: neutral OR (same major AND same track).
+        if user_version == "old":
+            if user_year in {"1", "2"}:
+                return {}
+            if user_year == "3":
+                if selected_track:
+                    return {"$or": [neutral_course_filter, {"track": selected_track}]}
+                return neutral_course_filter
+            if user_year in {"4", "5"}:
+                if selected_major and selected_track:
+                    return {
+                        "$or": [
+                            neutral_course_filter,
+                            {"$and": [{"major": selected_major}, {"track": selected_track}]},
+                        ]
+                    }
+                return neutral_course_filter
+            return {}
 
-        # New students ignore track constraints.
+        # NEW students current-courses rule.
         if is_new_student:
             if selected_major:
-                # New + major: strict major match.
                 return {"major": selected_major}
-            # New + no major: only neutral courses.
             return neutral_course_filter
 
-        # Old students:
-        # - track only => same track (major can be anything)
-        # - major + track => same major+track
-        # - major only => semester-only
-        # - neither => only neutral courses
-        if selected_major and selected_track:
-            return {"major": selected_major, "track": selected_track}
-        if selected_track:
-            return {"track": selected_track}
-        if not selected_major and not selected_track:
-            return neutral_course_filter
+        # Fallback for unknown program labels.
         return {}
 
     def _and_filters(*parts: Dict[str, Any]) -> Dict[str, Any]:
@@ -461,7 +554,9 @@ async def get_current_courses(current_user: Dict[str, Any] = Depends(get_current
 
     # 1. Find semester-compatible courses, then apply major/track and "not already passed".
     progress_filter = _build_progress_filter()
-    base_course_query: Dict[str, Any] = _and_filters(progress_filter)
+    user_version, _, _ = _parse_semester_label(current_year_str)
+    year_rule_filter = {} if user_version == "old" else _build_year_rule_filter(current_year_str)
+    base_course_query: Dict[str, Any] = _and_filters(progress_filter, year_rule_filter)
     semester_courses = await Course.find(base_course_query).to_list()
     suitable_courses = [
         c for c in semester_courses
@@ -510,6 +605,7 @@ async def get_current_courses(current_user: Dict[str, Any] = Depends(get_current
         retake_query = _and_filters(
             retake_query,
             progress_filter,
+            year_rule_filter,
         )
         retake_courses_raw = await Course.find(retake_query).to_list()
         retake_courses_objs = [
@@ -1148,9 +1244,11 @@ async def search_courses(
         sort_index = track_sort_priority.get(course_track_norm, 99)
 
         is_program_eligible = _is_program_eligible_for_student(
+            current_year=user_current_year_str,
             is_new_student=is_new_student,
             selected_major=selected_major,
             selected_track=selected_track,
+            course_type=c_type,
             course_major=course_major,
             course_track=course_track,
         )
@@ -1631,11 +1729,27 @@ async def finalize_enrollment(
 ):
     student_id = current_user["user_id"]
 
-    # Get semester from student profile
+    # Use profile first, then students_progress fallback from auth context.
     student_profile = current_user.get("student_profile") or {}
-    current_semester = student_profile.get("current_year")
+    progress_doc = current_user.get("students_progress") or {}
+    if not isinstance(progress_doc, dict):
+        progress_doc = {}
+
+    profile_current_year = str(student_profile.get("current_year") or "").strip()
+    progress_current_year = str(progress_doc.get("current_year") or "").strip()
+    progress_current_semester = str(progress_doc.get("current_semester") or "").strip()
+    progress_semester_label = (
+        f"{progress_current_year}, {progress_current_semester}"
+        if progress_current_year and progress_current_semester
+        else progress_current_year
+    )
+    current_semester = profile_current_year or progress_semester_label
 
     if not current_semester:
+         logger.warning(
+             "Enrollment rejected: student=%s has no current semester in profile/progress.",
+             student_id,
+         )
          raise HTTPException(status_code=400, detail="Student has no current semester set")
 
     effective_settings = await get_effective_enrollment_settings_for_user(current_user=current_user)
@@ -1675,6 +1789,12 @@ async def finalize_enrollment(
     if effective_settings.max_courses is not None:
         projected_count = len(active_course_ids) + len(candidate_courses)
         if projected_count > int(effective_settings.max_courses):
+            logger.warning(
+                "Enrollment rejected: student=%s exceeds max_courses (projected=%s limit=%s).",
+                student_id,
+                projected_count,
+                effective_settings.max_courses,
+            )
             raise HTTPException(
                 status_code=400,
                 detail=f"Enrollment exceeds max_courses limit ({effective_settings.max_courses}).",
@@ -1682,6 +1802,12 @@ async def finalize_enrollment(
 
     projected_total = active_total_credits + sum(float(c.credits) for c in candidate_courses)
     if projected_total > float(effective_settings.max_credits):
+        logger.warning(
+            "Enrollment rejected: student=%s exceeds max_credits (projected=%.2f limit=%.2f).",
+            student_id,
+            projected_total,
+            float(effective_settings.max_credits),
+        )
         raise HTTPException(
             status_code=400,
             detail=(
@@ -1694,13 +1820,27 @@ async def finalize_enrollment(
     for course in candidate_courses:
         missing_prereqs = [req for req in (course.prerequisites or []) if req not in passed_codes]
         if missing_prereqs:
+            logger.warning(
+                "Enrollment rejected: student=%s missing prerequisites for %s -> %s.",
+                student_id,
+                course.course_code,
+                ",".join(missing_prereqs),
+            )
             raise HTTPException(
                 status_code=400,
                 detail=f"Missing prerequisite(s) for {course.course_code}: {', '.join(missing_prereqs)}",
             )
 
-    history = student_profile.get("academic_history", []) or current_user.get("academic_history", [])
-    retake_codes = {str(h.get("course_code") or "").strip() for h in history if h.get("course_code")}
+    history = (
+        student_profile.get("academic_history", [])
+        or progress_doc.get("academic_history", [])
+        or current_user.get("academic_history", [])
+    )
+    retake_codes = {
+        str(h.get("course_code") or h.get("course_id") or "").strip()
+        for h in history
+        if (h.get("course_code") or h.get("course_id"))
+    }
 
     for course in candidate_courses:
         new_enr = Enrollment(

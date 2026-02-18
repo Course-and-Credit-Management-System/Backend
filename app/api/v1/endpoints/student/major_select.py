@@ -14,8 +14,8 @@ async def _get_col(db, names: list[str]):
 FOUR_YEAR_MAJORS = ["SE", "KE", "BIS", "CSec", "HPC", "CN", "ES"]
 TRACKS = ["CS", "CT"]
 TRACK_MAJORS = {
-    "CS": ["SE", "KE", "BIS", "CSec"],
-    "CT": ["CN", "HPC", "ES"],
+    "CS": ["SE", "KE", "BIS"],
+    "CT": ["CSec"],
 }
 
 def _year_to_num(label: str | None) -> int | None:

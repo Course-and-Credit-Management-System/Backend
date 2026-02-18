@@ -343,6 +343,40 @@ Copy this block for each trial:
 - Next step:
   - Add endpoint tests for token separators and alias handling.
 
+### Experiment ID: EXP-0012
+- Date: 2026-02-18
+- Owner: Backend team
+- Goal: Align special-major access flow with explicit track selection endpoint
+- Hypothesis: Adding a dedicated `POST /student/special-major/track` endpoint (instead of reusing major routes) will remove route mismatch errors from the Special Major Access page.
+- Change:
+  - Updated `app/api/v1/endpoints/student/special_major_access.py`
+  - Added `POST /special-major/track`
+  - Validation rules:
+    - Accept only `CS` or `CT`
+    - Allow only `5-year` program
+    - Reuse special-major eligibility gates
+    - Block track changes after `selected_major` is already set
+  - Persistence:
+    - `StudentsProgress.selected_track`
+    - `Users.student_profile.major_track`
+- Data/Prompt/Mode used:
+  - N/A (non-chatbot endpoint behavior)
+- Result:
+  - Quality: Special Major Access flow now has a native track-selection route in its own module.
+  - Latency: No material impact (single upsert/update path).
+  - Reliability: Reduced integration ambiguity between `/major/track` and `/special-major/*` routes.
+- Decision: Keep
+- Notes:
+  - Existing `POST /student/special-major/select` remains for major selection.
+  - New route is `POST /api/v1/student/special-major/track`.
+- Next step:
+  - Add API tests for:
+    - valid track (`CS`, `CT`)
+    - invalid track payload
+    - non-5-year user
+    - already selected major lock
+    - ineligible year/semester
+
 ## Failure/Issue Log
 Use this table for real incidents and regressions.
 
@@ -351,6 +385,7 @@ Use this table for real incidents and regressions.
 | 2026-02-14 | INC-0001 | Chat payload drift across routes | Extra optional fields in request body | Standardized request schema | Add schema contract check in CI |
 | 2026-02-16 | INC-0002 | `/student/courses/current` returned cross-major courses | Eligibility initially checked on wrong endpoint and lacked final filter coupling in active flow | Moved/kept logic in `student/courses.py` and tied to `students_progress` + semester | Add endpoint ownership note in docs and regression tests for route path |
 | 2026-02-16 | INC-0003 | Expected common semester core course not shown when student already had enrollments | Standard courses were only auto-added on "fresh start" (`if not existing_course_ids`) | Always add missing eligible semester courses, then dedupe by existing enrollments | Add regression test for partial-existing-enrollment scenario |
+| 2026-02-18 | INC-0004 | Special Major Access UI could not complete track selection | Missing dedicated `/student/special-major/track` endpoint; flow depended on a different route contract | Added `POST /student/special-major/track` in `special_major_access.py` with consistent eligibility + persistence | Add endpoint checklist: "UI route exists, request/response contract documented, and module-local endpoint parity verified" |
 
 ## Known Risks
 - Admin context size can grow too large as student records increase.
