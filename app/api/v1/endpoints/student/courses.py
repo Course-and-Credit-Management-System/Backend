@@ -240,7 +240,7 @@ class EnrollmentResponse(BaseModel):
 class DashboardResponse(BaseModel):
     semester_name: str
     total_credits: float
-    max_credits: float = 18.0
+    max_credits: float = 24.0
     courses_count: int
     courses: List[CourseResponse]
 

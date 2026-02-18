@@ -14,6 +14,7 @@ class Settings(BaseSettings):
 
     # Database - MongoDB
     MONGODB_URL: str
+    MONGODB_FALLBACK_URL: str | None = None
     MONGODB_DB_NAME: str
 
     # CORS

@@ -1,17 +1,20 @@
 """Database configuration for MongoDB."""
-from motor.motor_asyncio import AsyncIOMotorClient
+from typing import Optional
+
 from beanie import init_beanie
+from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo.errors import ConfigurationError, PyMongoError
 
 from app.core.config import get_settings
-from app.models.user import User
-from app.models.major import Major
+from app.models.alert import Alert
+from app.models.announcement import Announcement
 from app.models.course import Course
 from app.models.enrollment import Enrollment
-from app.models.announcement import Announcement
+from app.models.enrollment_setting import EnrollmentSetting
+from app.models.major import Major
 from app.models.message import Message
 from app.models.student_result import StudentResultDB
-from app.models.alert import Alert
-from app.models.enrollment_setting import EnrollmentSetting
+from app.models.user import User
 
 settings = get_settings()
 
@@ -22,30 +25,51 @@ client: AsyncIOMotorClient = None
 async def init_db():
     """Initialize MongoDB connection and Beanie ODM."""
     global client
-    
-    # Use connection string from environment
-    # For Atlas, the connection string should include tls parameters
-    client = AsyncIOMotorClient(
-        settings.MONGODB_URL,
-        serverSelectionTimeoutMS=5000,  # 5 second timeout
-        connectTimeoutMS=10000,  # 10 second connection timeout
-        socketTimeoutMS=20000  # 20 second socket timeout
-    )
+
+    async def _connect(url: str) -> AsyncIOMotorClient:
+        mongo_client = AsyncIOMotorClient(
+            url,
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=10000,
+            socketTimeoutMS=20000,
+        )
+        await mongo_client.admin.command("ping")
+        return mongo_client
+
+    client = None
+    primary_error: Optional[Exception] = None
+
+    try:
+        client = await _connect(settings.MONGODB_URL)
+        print("Successfully connected to MongoDB (primary URL).")
+    except (ConfigurationError, PyMongoError) as exc:
+        primary_error = exc
+        fallback_url = settings.MONGODB_FALLBACK_URL
+        if fallback_url:
+            try:
+                client = await _connect(fallback_url)
+                print("Primary MongoDB connection failed, connected via fallback URL.")
+            except (ConfigurationError, PyMongoError) as fallback_exc:
+                raise RuntimeError(
+                    "MongoDB connection failed for both primary MONGODB_URL and "
+                    "MONGODB_FALLBACK_URL."
+                ) from fallback_exc
+        else:
+            raise RuntimeError(
+                "MongoDB connection failed. If you are using mongodb+srv and your network "
+                "blocks DNS SRV lookups, set MONGODB_FALLBACK_URL to a reachable mongodb:// URI."
+            ) from exc
+
+    if client is None:
+        raise RuntimeError("MongoDB client was not initialized.") from primary_error
+
     database = client[settings.MONGODB_DB_NAME]
-    
-    # Test connection
-    await client.admin.command('ping')
-    print("Successfully connected to MongoDB!")
-    
-        # 🔐 CREATE INDEXES FOR PASSWORD RESET TOKENS (NEW)
+
     await database["ResetTokens"].create_index("token_hash", unique=True)
     await database["ResetTokens"].create_index([("user_id", 1), ("created_at", -1)])
     await database["ResetTokens"].create_index("expires_at")
-
     print("ResetTokens indexes ensured.")
 
-    
-    # Initialize Beanie with document models
     await init_beanie(
         database=database,
         document_models=[
@@ -58,7 +82,7 @@ async def init_db():
             StudentResultDB,
             Alert,
             EnrollmentSetting,
-        ]
+        ],
     )
 
 
