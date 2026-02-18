@@ -300,14 +300,119 @@ async def get_recent_activity():
     ]
 
 @router.get("/degree-audit", response_model=schemas.DegreeAudit)
-async def get_degree_audit():
+async def get_degree_audit(current_user=Depends(get_current_user)):
     """
-    Returns breakdown of Core vs Elective credits.
+    Calculate Core Requirements, Major Electives, and General Education from real data.
     """
+    db = await get_database()
+    users = await _get_col(db, ["Users", "users"])
+    enrollments = await _get_col(db, ["Enrollments", "enrollments"])
+    courses = await _get_col(db, ["Courses", "courses"])
+    majors = await _get_col(db, ["majors", "Majors"])
+
+    user_id = current_user.get("user_id")
+    user_doc = await users.find_one({"user_id": user_id}) or {}
+    sp = user_doc.get("student_profile") or {}
+    major_id = sp.get("major_id")
+
+    # Load major requirements and department if available
+    major_doc = await majors.find_one({"_id": major_id}) if major_id else None
+    requirement_codes = set((major_doc or {}).get("requirements") or [])
+    major_department = (major_doc or {}).get("department")
+
+    # Helper to load a course by id or code
+    async def load_course(course_id_or_code: str):
+        if not course_id_or_code:
+            return None
+        c = await courses.find_one({"_id": course_id_or_code})
+        if not c:
+            c = await courses.find_one({"course_code": course_id_or_code})
+        return c
+
+    # Aggregate earned credits by category from enrollments
+    earn_core = 0.0
+    earn_major_elec = 0.0
+    earn_gen_ed = 0.0
+
+    passed_statuses = {"Passed", "Completed"}
+    enroll_query = {
+        "$or": [
+            {"student_id": user_id},
+            {"student_user_id": user_id},
+            {"user_id": user_id},
+        ],
+        "status": {"$in": list(passed_statuses)}
+    }
+    async for enr in enrollments.find(enroll_query):
+        course_id_or_code = enr.get("course_id") or enr.get("course_code") or ""
+        course = await load_course(course_id_or_code)
+        credits = float((course or {}).get("credits") or enr.get("credits") or 0)
+        ctype = ((course or {}).get("type") or "").strip()
+        major_specific = bool((course or {}).get("major_specific") or False)
+        dept = (course or {}).get("department")
+        code = (course or {}).get("course_code") or course_id_or_code
+
+        # Categorize
+        is_core = (code in requirement_codes) or (ctype.lower() == "core")
+        is_major_elective = (ctype.lower() == "major") or (ctype.lower() == "elective" and major_specific)
+        # General Education fallback: electives not major-specific or courses under explicit department
+        is_gen_ed = (not is_core and not is_major_elective) or (str(dept or "").lower() in ["general education", "general"])
+
+        if is_core:
+            earn_core += credits
+        elif is_major_elective:
+            earn_major_elec += credits
+        elif is_gen_ed:
+            earn_gen_ed += credits
+
+    # Compute required credits from catalog
+    # Core required: sum credits of requirement list; if none, sum all "Core" courses (optionally filtered by department)
+    core_required = 0.0
+    if requirement_codes:
+        req_courses = await courses.find({"course_code": {"$in": list(requirement_codes)}}).to_list(None)
+        if req_courses:
+            core_required = sum(float(c.get("credits") or 0) for c in req_courses)
+    if core_required <= 0:
+        criteria = {"type": {"$in": ["Core", "core"]}}
+        if major_department:
+            criteria["department"] = major_department
+        core_courses = await courses.find(criteria).to_list(None)
+        core_required = sum(float(c.get("credits") or 0) for c in core_courses)
+
+    # Major electives required: sum credits of "Major" or elective major_specific courses (optionally filtered by department)
+    me_criteria = {
+        "$or": [
+            {"type": {"$in": ["Major", "major"]}},
+            {"$and": [{"type": {"$in": ["Elective", "elective"]}}, {"major_specific": True}]}
+        ]
+    }
+    if major_department:
+        me_criteria["department"] = major_department
+    major_elective_courses = await courses.find(me_criteria).to_list(None)
+    major_electives_required = sum(float(c.get("credits") or 0) for c in major_elective_courses)
+
+    # General education required: department 'General Education' or electives not major_specific
+    ge_criteria = {
+        "$or": [
+            {"department": {"$in": ["General Education", "General education", "general education", "General"]}},
+            {"$and": [{"type": {"$in": ["Elective", "elective"]}}, {"$or": [{"major_specific": False}, {"major_specific": {"$exists": False}}]}]}
+        ]
+    }
+    ge_courses = await courses.find(ge_criteria).to_list(None)
+    general_ed_required = sum(float(c.get("credits") or 0) for c in ge_courses)
+
+    # Sensible minimums if catalog is empty
+    if core_required <= 0:
+        core_required = 0.0
+    if major_electives_required <= 0:
+        major_electives_required = 0.0
+    if general_ed_required <= 0:
+        general_ed_required = 0.0
+
     return {
-        "core_credits": { "earned": 45, "required": 60 },
-        "elective_credits": { "earned": 12, "required": 15 },
-        "major_specific": { "earned": 7, "required": 10 }
+        "core_credits": {"earned": round(earn_core, 2), "required": round(core_required, 2)},
+        "elective_credits": {"earned": round(earn_major_elec, 2), "required": round(major_electives_required, 2)},
+        "major_specific": {"earned": round(earn_gen_ed, 2), "required": round(general_ed_required, 2)},
     }
 
 @router.get("/status", response_model=schemas.AcademicStatus)

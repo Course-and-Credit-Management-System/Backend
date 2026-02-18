@@ -92,10 +92,11 @@ def _validate_major(program_type: str, track: str | None, major: str):
 def _compute_eligibility(doc: dict) -> dict:
     prof_raw = doc.get("__profile_current_year_raw")
     prof_pt = _profile_program_type(prof_raw)
-    program_type = doc.get("program_type") or prof_pt or "4-year"
+    prof_pd = doc.get("__profile_program_duration")
+    program_type = doc.get("program_type") or (prof_pd if prof_pd in ("4-year", "5-year") else None) or prof_pt or "4-year"
     ynum = _year_to_num(doc.get("current_year"))
     snum = _semester_to_num(doc.get("current_semester"))
-    track = doc.get("selected_track")
+    track = doc.get("selected_track") or doc.get("__profile_major_track")
     has_major = bool(doc.get("selected_major"))
     access_ok = bool(doc.get("major_access_approved"))
     # Fallback: derive from Users.student_profile.current_year if missing
@@ -162,7 +163,7 @@ def _compute_eligibility(doc: dict) -> dict:
             reason = "Major selection is no longer available."
         can_select_track = False
     else:  # 5-year
-        # Track selection rule: allowed in 3rd Year (both semesters)
+        # Track selection rule: allowed in 3rd Year (both semesters) only
         if ynum == 3:
             can_select_track = True
         else:
@@ -232,7 +233,7 @@ def _status_from_eligibility(elig: dict, doc: dict) -> str:
 async def major_state(current_user=Depends(get_current_user)):
     db = await get_database()
     col = await _get_col(db, ["StudentsProgress", "students_progress"])
-    doc = await col.find_one({"student_id": current_user["user_id"]})
+    doc = await col.find_one({"$or": [{"student_id": current_user["user_id"]}, {"user_id": current_user["user_id"]}]})
     if not doc:
         raise HTTPException(status_code=404, detail="Progress not found")
     # Merge profile data
@@ -240,6 +241,8 @@ async def major_state(current_user=Depends(get_current_user)):
     udoc = await users.find_one({"user_id": current_user["user_id"]})
     profile = (udoc or {}).get("student_profile") or {}
     doc["__profile_current_year_raw"] = profile.get("current_year")
+    doc["__profile_program_duration"] = profile.get("program_duration")
+    doc["__profile_major_track"] = profile.get("major_track")
     state = {
         "program_type": doc.get("program_type"),
         "academic_year": doc.get("academic_year"),
@@ -247,6 +250,8 @@ async def major_state(current_user=Depends(get_current_user)):
         "current_semester": doc.get("current_semester"),
         "selected_track": doc.get("selected_track"),
         "selected_major": doc.get("selected_major"),
+        "profile_major_id": profile.get("major_id"),
+        "profile_major_track": profile.get("major_track"),
     }
     elig = _compute_eligibility(doc)
     return {**state, **elig, "status": _status_from_eligibility(elig, doc)}
@@ -255,23 +260,25 @@ async def major_state(current_user=Depends(get_current_user)):
 async def major_options(current_user=Depends(get_current_user)):
     db = await get_database()
     col = await _get_col(db, ["StudentsProgress", "students_progress"])
-    doc = await col.find_one({"student_id": current_user["user_id"]})
+    doc = await col.find_one({"$or": [{"student_id": current_user["user_id"]}, {"user_id": current_user["user_id"]}]})
     if not doc:
         raise HTTPException(status_code=404, detail="Progress not found")
     users = await _get_col(db, ["Users", "users"])
     udoc = await users.find_one({"user_id": current_user["user_id"]})
     profile = (udoc or {}).get("student_profile") or {}
     doc["__profile_current_year_raw"] = profile.get("current_year")
+    doc["__profile_major_track"] = profile.get("major_track")
     elig = _compute_eligibility(doc)
-    if elig["track_required"] and not doc.get("selected_track"):
+    effective_track = doc.get("selected_track") or profile.get("major_track")
+    if elig["track_required"] and not effective_track:
         return {"type": "tracks", "tracks": TRACKS, "eligibility": elig, "status": _status_from_eligibility(elig, doc)}
-    return {"type": "majors", "track": doc.get("selected_track"), "majors": elig.get("allowed_majors", []), "eligibility": elig, "status": _status_from_eligibility(elig, doc)}
+    return {"type": "majors", "track": effective_track, "majors": elig.get("allowed_majors", []), "eligibility": elig, "status": _status_from_eligibility(elig, doc)}
 
 @router.get("/major/eligibility", tags=["student"])
 async def major_eligibility(current_user=Depends(get_current_user)):
     db = await get_database()
     col = await _get_col(db, ["StudentsProgress", "students_progress"])
-    doc = await col.find_one({"student_id": current_user["user_id"]})
+    doc = await col.find_one({"$or": [{"student_id": current_user["user_id"]}, {"user_id": current_user["user_id"]}]})
     if not doc:
         raise HTTPException(status_code=404, detail="Progress not found")
     users = await _get_col(db, ["Users", "users"])
@@ -288,7 +295,7 @@ async def select_track(payload: dict, current_user=Depends(get_current_user)):
         raise HTTPException(status_code=422, detail="Invalid track")
     db = await get_database()
     col = await _get_col(db, ["StudentsProgress", "students_progress"])
-    doc = await col.find_one({"student_id": current_user["user_id"]})
+    doc = await col.find_one({"$or": [{"student_id": current_user["user_id"]}, {"user_id": current_user["user_id"]}]})
     if not doc:
         raise HTTPException(status_code=404, detail="Progress not found")
     if doc.get("program_type") != "5-year":
@@ -303,7 +310,45 @@ async def select_track(payload: dict, current_user=Depends(get_current_user)):
     elig = _compute_eligibility(doc)
     if not elig.get("can_select_track"):
         raise HTTPException(status_code=403, detail=elig.get("reason") or "Track selection is not allowed now")
-    await col.update_one({"student_id": current_user["user_id"]}, {"$set": {"selected_track": track, "selected_major": None, "updated_at": __import__("datetime").datetime.utcnow()}})
+    # Dynamic rules:
+    # - 3rd Year (both semesters): allow selecting/changing track; always update Users.major_track
+    # - 4th Year, First Semester: require track match with Users.major_track if present
+    expected_track = str((profile.get("Major_trak") or profile.get("major_track") or "")).upper()
+    ynum = elig.get("current_year_num")
+    snum = elig.get("current_semester_num")
+    if ynum == 4 and snum == 1 and expected_track in TRACKS and track != expected_track:
+        raise HTTPException(status_code=409, detail="Entered track major is incorrect. Please enter the real user track major.")
+    # Update progress and clear any previously selected major
+    updates = {
+        "student_id": current_user["user_id"],
+        "user_id": current_user["user_id"],
+        "selected_track": track,
+        "selected_major": None,
+        "program_type": doc.get("program_type") or "5-year",
+        "program_duration": doc.get("program_type") or "5-year",
+        "updated_at": __import__("datetime").datetime.utcnow(),
+    }
+    if not doc.get("academic_year"):
+        updates["academic_year"] = ""
+    if not doc.get("current_year") or not doc.get("current_semester"):
+        if yl:
+            updates["current_year"] = yl
+        if sl:
+            updates["current_semester"] = sl
+    await col.update_one(
+        {"$or": [{"student_id": current_user["user_id"]}, {"user_id": current_user["user_id"]}]},
+        {"$set": updates},
+        upsert=True
+    )
+    # Always persist selected track to Users profile in 3rd Year or when not set
+    try:
+        if ynum == 3 or not expected_track:
+            await users.update_one(
+                {"user_id": current_user["user_id"]},
+                {"$set": {"student_profile.major_track": track}}
+            )
+    except Exception:
+        pass
     return {"selected_track": track}
 
 @router.post("/major/select", tags=["student"])
@@ -313,11 +358,24 @@ async def select_major(payload: dict, current_user=Depends(get_current_user)):
         raise HTTPException(status_code=422, detail="major is required")
     db = await get_database()
     col = await _get_col(db, ["StudentsProgress", "students_progress"])
-    doc = await col.find_one({"student_id": current_user["user_id"]})
+    doc = await col.find_one({"$or": [{"student_id": current_user["user_id"]}, {"user_id": current_user["user_id"]}]})
     if not doc:
         raise HTTPException(status_code=404, detail="Progress not found")
     program_type = doc.get("program_type") or "4-year"
-    track = doc.get("selected_track")
+    # effective track: prefer StudentsProgress selected_track, fallback to Users profile major_track
+    users = await _get_col(db, ["Users", "users"])
+    udoc = await users.find_one({"user_id": current_user["user_id"]})
+    profile = (udoc or {}).get("student_profile") or {}
+    track = doc.get("selected_track") or profile.get("major_track")
+    # Derive track from selected major if missing for 5-year 4Y1 selection flows
+    if program_type == "5-year" and not track:
+        for t, lst in TRACK_MAJORS.items():
+            if major in lst:
+                track = t
+                break
+    # Ensure eligibility sees the derived track
+    if track and not doc.get("selected_track"):
+        doc["selected_track"] = track
     # Enforce year/semester match against Users profile before allowing major selection
     users = await _get_col(db, ["Users", "users"])
     udoc = await users.find_one({"user_id": current_user["user_id"]})
@@ -332,22 +390,60 @@ async def select_major(payload: dict, current_user=Depends(get_current_user)):
         raise HTTPException(status_code=400, detail="Major selection is no longer available.")
     if not _validate_major(program_type, track, major):
         raise HTTPException(status_code=400, detail="Invalid major for program/track")
+    year_label = doc.get("current_year")
+    sem_label = doc.get("current_semester")
+    if not year_label or not sem_label:
+        py2, ps2, yl2, sl2 = _parse_profile_current_year(profile.get("current_year"))
+        if yl2 and not year_label:
+            year_label = yl2
+        if sl2 and not sem_label:
+            sem_label = sl2
+    updates = {
+        "student_id": current_user["user_id"],
+        "user_id": current_user["user_id"],
+        "selected_major": major,
+        "selected_major_at": __import__("datetime").datetime.utcnow(),
+        "program_type": program_type,
+        "program_duration": program_type,
+        "selected_track": track,
+        "updated_at": __import__("datetime").datetime.utcnow(),
+    }
+    if not doc.get("academic_year"):
+        updates["academic_year"] = ""
+    if year_label:
+        updates["current_year"] = year_label
+    if sem_label:
+        updates["current_semester"] = sem_label
     await col.update_one(
-        {"student_id": current_user["user_id"]},
-        {"$set": {
-            "selected_major": major,
-            "selected_major_at": __import__("datetime").datetime.utcnow(),
-            "program_duration": program_type
-        }}
+        {"$or": [{"student_id": current_user["user_id"]}, {"user_id": current_user["user_id"]}]},
+        {"$set": updates},
+        upsert=True
     )
+    try:
+        eff_track = track
+        if not eff_track:
+            for t, lst in TRACK_MAJORS.items():
+                if major in lst:
+                    eff_track = t
+                    break
+        await users.update_one(
+            {"user_id": current_user["user_id"]},
+            {"$set": {"student_profile.major_id": major, "student_profile.major_track": eff_track}}
+        )
+    except Exception:
+        pass
     return {"selected_major": major, "program_duration": program_type, "selected_track": track, "message": "Major selected and permanently locked."}
 
 @router.post("/major/access-approve", tags=["student"])
 async def approve_access(current_user=Depends(get_current_user)):
     db = await get_database()
     col = await _get_col(db, ["StudentsProgress", "students_progress"])
-    doc = await col.find_one({"student_id": current_user["user_id"]})
+    doc = await col.find_one({"$or": [{"student_id": current_user["user_id"]}, {"user_id": current_user["user_id"]}]})
     if not doc:
         raise HTTPException(status_code=404, detail="Progress not found")
-    await col.update_one({"student_id": current_user["user_id"]}, {"$set": {"major_access_approved": True, "updated_at": __import__("datetime").datetime.utcnow()}})
+    await col.update_one(
+        {"$or": [{"student_id": current_user["user_id"]}, {"user_id": current_user["user_id"]}]},
+        {"$set": {"major_access_approved": True, "updated_at": __import__("datetime").datetime.utcnow()}},
+        upsert=True
+    )
     return {"major_access_approved": True}
