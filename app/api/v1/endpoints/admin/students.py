@@ -332,6 +332,247 @@ async def import_students_from_excel(file: UploadFile = File(...), _admin=Depend
         raise HTTPException(status_code=500, detail=str(e)[:100])
 
 
+@router.post("/backfill-special-major-progress")
+async def backfill_special_major_progress(_admin=Depends(require_admin)):
+    db = await get_database()
+    progress_col = await _get_col(db, ["StudentsProgress", "students_progress"])
+    users_col = await _get_col(db, ["Users", "users"])
+
+    now = datetime.now(timezone.utc)
+    updated = 0
+    checked = 0
+
+    cursor = progress_col.find({
+        "selected_major": {"$exists": True, "$ne": None, "$ne": ""},
+    })
+
+    async for doc in cursor:
+        checked += 1
+        set_updates = {}
+
+        sid = doc.get("student_id")
+        uid = doc.get("user_id")
+        if not sid and uid:
+            set_updates["student_id"] = uid
+        if not uid and sid:
+            set_updates["user_id"] = sid
+
+        pdur = doc.get("program_duration")
+        ptype = doc.get("program_type")
+        if not pdur and ptype:
+            set_updates["program_duration"] = ptype
+
+        if "academic_year" not in doc:
+            set_updates["academic_year"] = ""
+
+        if not doc.get("current_year") or not doc.get("current_semester"):
+            ref_id = (sid or uid)
+            if ref_id:
+                u = await users_col.find_one({"user_id": ref_id})
+                sp = (u or {}).get("student_profile") or {}
+                curr = sp.get("current_year") or ""
+                # parse to ints using existing helper
+                try:
+                    yr, sem = parse_academic_year(curr)
+                except Exception:
+                    yr, sem = None, None
+                if yr in (1, 2, 3, 4, 5) and not doc.get("current_year"):
+                    set_updates["current_year"] = {1: "First Year", 2: "Second Year", 3: "Third Year", 4: "Fourth Year", 5: "Fifth Year"}[yr]
+                if sem in (1, 2) and not doc.get("current_semester"):
+                    set_updates["current_semester"] = {1: "First Semester", 2: "Second Semester"}[sem]
+
+        set_updates["updated_at"] = now
+
+        if set_updates:
+            await progress_col.update_one(
+                {"_id": doc["_id"]},
+                {"$set": set_updates}
+            )
+            updated += 1
+
+    return {"success": True, "checked": checked, "updated": updated}
+
+@router.post("/backfill-students-progress-standardize")
+async def backfill_students_progress_standardize(_admin=Depends(require_admin)):
+    db = await get_database()
+    progress_col = await _get_col(db, ["StudentsProgress", "students_progress"])
+    users_col = await _get_col(db, ["Users", "users"])
+
+    now = datetime.now(timezone.utc)
+    updated = 0
+    checked = 0
+
+    cursor = progress_col.find({})
+
+    async for doc in cursor:
+        checked += 1
+        set_updates = {}
+        sid = doc.get("student_id")
+        uid = doc.get("user_id")
+        if not sid and uid:
+            set_updates["student_id"] = uid
+        if not uid and sid:
+            set_updates["user_id"] = sid
+        pdur = doc.get("program_duration")
+        ptype = doc.get("program_type")
+        if not ptype and pdur:
+            set_updates["program_type"] = pdur
+        if not pdur and ptype:
+            set_updates["program_duration"] = ptype
+        if "academic_year" not in doc:
+            set_updates["academic_year"] = ""
+        if not doc.get("current_year") or not doc.get("current_semester"):
+            ref_id = (sid or uid)
+            if ref_id:
+                u = await users_col.find_one({"user_id": ref_id})
+                sp = (u or {}).get("student_profile") or {}
+                curr = sp.get("current_year") or ""
+                try:
+                    yr, sem = parse_academic_year(curr)
+                except Exception:
+                    yr, sem = None, None
+                if yr in (1, 2, 3, 4, 5) and not doc.get("current_year"):
+                    set_updates["current_year"] = {1: "First Year", 2: "Second Year", 3: "Third Year", 4: "Fourth Year", 5: "Fifth Year"}[yr]
+                if sem in (1, 2) and not doc.get("current_semester"):
+                    set_updates["current_semester"] = {1: "First Semester", 2: "Second Semester"}[sem]
+        if "selected_major" not in doc:
+            set_updates["selected_major"] = ""
+        if "selected_track" not in doc:
+            set_updates["selected_track"] = ""
+        if (not doc.get("selected_major_at")) and (doc.get("selected_major")):
+            set_updates["selected_major_at"] = now
+        if not doc.get("updated_at"):
+            set_updates["updated_at"] = now
+        if set_updates:
+            await progress_col.update_one({"_id": doc["_id"]}, {"$set": set_updates})
+            updated += 1
+
+    return {"success": True, "checked": checked, "updated": updated}
+
+@router.post("/ensure-progress-docs")
+async def ensure_progress_docs(_admin=Depends(require_admin)):
+    db = await get_database()
+    users_col = await _get_col(db, ["Users", "users"])
+    progress_col = await _get_col(db, ["StudentsProgress", "students_progress"])
+
+    created = 0
+    updated = 0
+    total = 0
+
+    cursor = users_col.find({"role": {"$in": ["student", "Student"]}})
+    async for u in cursor:
+        total += 1
+        sid = u.get("user_id")
+        if not sid:
+            continue
+        doc = await progress_col.find_one({"$or": [{"student_id": sid}, {"user_id": sid}]})
+        if not doc:
+            base = {
+                "student_id": sid,
+                "user_id": sid,
+                "academic_year": "",
+                "current_semester": "",
+                "current_year": "",
+                "program_duration": "",
+                "program_type": "",
+                "selected_major": "",
+                "selected_major_at": "",
+                "selected_track": "",
+                "updated_at": __import__("datetime").datetime.utcnow(),
+            }
+            await progress_col.update_one(
+                {"student_id": sid},
+                {"$set": base},
+                upsert=True,
+            )
+            created += 1
+        else:
+            set_updates = {}
+            for k in ["academic_year","current_semester","current_year","program_duration","program_type","selected_major","selected_major_at","selected_track","updated_at"]:
+                if k not in doc:
+                    if k == "updated_at":
+                        set_updates[k] = __import__("datetime").datetime.utcnow()
+                    else:
+                        set_updates[k] = ""
+            if not doc.get("student_id") and sid:
+                set_updates["student_id"] = sid
+            if not doc.get("user_id") and sid:
+                set_updates["user_id"] = sid
+            if set_updates:
+                await progress_col.update_one({"_id": doc["_id"]}, {"$set": set_updates})
+                updated += 1
+
+    return {"success": True, "students_checked": total, "docs_created": created, "docs_updated": updated}
+
+@router.post("/hydrate-progress-from-users")
+async def hydrate_progress_from_users(_admin=Depends(require_admin)):
+    """
+    Fill StudentsProgress fields from Users.student_profile when they are empty:
+    - academic_year from student_profile.admission_academic_year
+    - current_year/current_semester from student_profile.current_year (normalized)
+    - program_type/program_duration from student_profile.program_duration or 'new/old' hint in current_year
+    - updated_at set to now
+    """
+    db = await get_database()
+    users_col = await _get_col(db, ["Users", "users"])
+    progress_col = await _get_col(db, ["StudentsProgress", "students_progress"])
+
+    now = datetime.now(timezone.utc)
+    checked = 0
+    updated = 0
+
+    async for doc in progress_col.find({}):
+        checked += 1
+        sid = doc.get("student_id") or doc.get("user_id")
+        if not sid:
+            continue
+        user = await users_col.find_one({"user_id": sid})
+        if not user:
+            continue
+        sp = (user.get("student_profile") or {})
+
+        set_updates = {}
+
+        # academic_year from profile (leave if doc already has non-empty)
+        if (not doc.get("academic_year")) and sp.get("admission_academic_year"):
+            set_updates["academic_year"] = sp.get("admission_academic_year") or ""
+
+        # normalize current year/semester labels from profile.current_year
+        curr = sp.get("current_year") or ""
+        try:
+            yr, sem = parse_academic_year(curr)
+        except Exception:
+            yr, sem = None, None
+        yr_label = {1: "First Year", 2: "Second Year", 3: "Third Year", 4: "Fourth Year", 5: "Fifth Year"}.get(yr, "")
+        sem_label = {1: "First Semester", 2: "Second Semester"}.get(sem, "")
+        if (not doc.get("current_year")) and yr_label:
+            set_updates["current_year"] = yr_label
+        if (not doc.get("current_semester")) and sem_label:
+            set_updates["current_semester"] = sem_label
+
+        # program type / duration from profile or 'new/old' hint
+        pt = sp.get("program_duration")
+        if not pt:
+            s = str(curr).lower()
+            if "new" in s:
+                pt = "4-year"
+            elif "old" in s:
+                pt = "5-year"
+        if pt:
+            if not doc.get("program_type"):
+                set_updates["program_type"] = pt
+            if not doc.get("program_duration"):
+                set_updates["program_duration"] = pt
+
+        set_updates["updated_at"] = now
+
+        if set_updates:
+            await progress_col.update_one({"_id": doc["_id"]}, {"$set": set_updates})
+            updated += 1
+
+    return {"success": True, "checked": checked, "updated": updated}
+
+
 @router.put("/{student_id}", response_model=StudentResponse)
 @router.post("/{student_id}/update", response_model=StudentResponse)
 async def update_student(student_id: str, student_update: StudentUpdate, _admin=Depends(require_admin)):

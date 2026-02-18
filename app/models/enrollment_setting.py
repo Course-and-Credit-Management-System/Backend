@@ -9,7 +9,7 @@ class EnrollmentSetting(Document):
     id: Optional[PydanticObjectId] = Field(default=None, alias="_id")
     enrollment_open_at: datetime
     enrollment_close_at: datetime
-    max_credits: float = Field(default=18.0, gt=0)
+    max_credits: float = Field(default=24.0, gt=0)
     max_courses: Optional[int] = Field(default=None, gt=0)
     allow_waitlist: bool = False
     is_active: bool = True

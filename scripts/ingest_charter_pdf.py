@@ -15,6 +15,7 @@ Usage (from Backend/ directory):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 import sys
 import zipfile
@@ -85,6 +86,49 @@ def normalize_text(text: str) -> str:
             blank = 0
             cleaned.append(stripped)
     return "\n".join(cleaned).strip()
+
+
+def _normalize_program_type(value: str) -> str | None:
+    normalized = (value or "").strip().lower().replace(" ", "").replace("-", "")
+    if not normalized:
+        return None
+    if normalized in {"4year", "4years", "fouryear", "year4"}:
+        return "4year"
+    if normalized in {"5year", "5years", "fiveyear", "year5"}:
+        return "5year"
+    if "4year" in normalized or "fouryear" in normalized:
+        return "4year"
+    if "5year" in normalized or "fiveyear" in normalized:
+        return "5year"
+    return None
+
+
+def infer_program_type(file_path: Path, text: str) -> str | None:
+    """Infer a coarse program bucket so retrieval can filter between similar files."""
+    filename = file_path.name.lower()
+    from_filename = None
+    if re.search(r"\b4\s*[-_ ]?year\b", filename) or "four year" in filename:
+        from_filename = "4year"
+    if re.search(r"\b5\s*[-_ ]?year\b", filename) or "five year" in filename:
+        from_filename = "5year"
+    if from_filename:
+        return from_filename
+
+    sample = (text or "")[:4000].lower()
+    if re.search(r"\b4\s*[- ]?year\b", sample) or "four year" in sample:
+        return "4year"
+    if re.search(r"\b5\s*[- ]?year\b", sample) or "five year" in sample:
+        return "5year"
+    return None
+
+
+def build_chunk_anchor(source: str, program_type: str | None, chunk_index: int, chunk_total: int) -> str:
+    program_label = program_type or "unspecified"
+    return f"[Source: {source} | Program: {program_label} | Chunk: {chunk_index + 1}/{chunk_total}]"
+
+
+def with_anchor(anchor: str, chunk: str) -> str:
+    return f"{anchor}\n{chunk}".strip()
 
 
 def _split_long_paragraph(paragraph: str, max_chars: int) -> List[str]:
@@ -189,11 +233,30 @@ def parse_args(argv: Iterable[str]) -> tuple[Path, int, int]:
     return Path(args.path), max(300, args.chunk_size), max(0, args.overlap)
 
 
+async def get_collection_with_retry(retries: int = 3, delay_seconds: float = 2.0):
+    """Get knowledge collection with simple retry for transient Atlas primary elections."""
+    last_error: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            db = await get_database()
+            await db.command("ping")
+            return db[settings.KNOWLEDGE_BASE_COLLECTION]
+        except Exception as exc:  # pragma: no cover - operational resilience
+            last_error = exc
+            if attempt < retries:
+                print(f"[ingest] Mongo connection attempt {attempt}/{retries} failed, retrying...")
+                await asyncio.sleep(delay_seconds)
+            else:
+                break
+    raise RuntimeError(f"Unable to connect to MongoDB after {retries} attempts: {last_error}")
+
+
 async def main(input_path: Path, chunk_size: int, overlap: int) -> None:
     files = resolve_input_files(input_path)
     if not files:
         raise RuntimeError("No supported files found (.pdf, .docx, .txt, .md, .docs).")
 
+    collection = await get_collection_with_retry()
     print(f"[ingest] Found {len(files)} file(s).")
     all_docs: List[dict] = []
 
@@ -210,25 +273,45 @@ async def main(input_path: Path, chunk_size: int, overlap: int) -> None:
             print(f"[ingest] No chunks generated: {file_path.name}")
             continue
 
+        program_type = _normalize_program_type(infer_program_type(file_path, full_text) or "")
+        anchored_chunks: List[str] = []
+        for idx, chunk in enumerate(chunks):
+            anchor = build_chunk_anchor(file_path.name, program_type, idx, len(chunks))
+            anchored_chunks.append(with_anchor(anchor, chunk))
+
         print(f"[ingest] {file_path.name}: {len(chunks)} chunks")
-        embeddings = await embed_texts(chunks, task_type="RETRIEVAL_DOCUMENT")
+        embeddings = await embed_texts(anchored_chunks, task_type="RETRIEVAL_DOCUMENT")
         if len(embeddings) != len(chunks):
             raise RuntimeError(f"Embeddings mismatch for {file_path.name}: {len(embeddings)} vs {len(chunks)}")
 
-        for idx, (chunk, emb) in enumerate(zip(chunks, embeddings)):
+        # Replace previously ingested chunks for this source to avoid duplicate retrieval noise.
+        await collection.delete_many(
+            {
+                "metadata.type": "docs",
+                "$or": [
+                    {"metadata.path": str(file_path)},
+                    {"metadata.source": file_path.name},
+                ],
+            }
+        )
+
+        for idx, (chunk, emb, anchored_chunk) in enumerate(zip(chunks, embeddings, anchored_chunks)):
+            chunk_hash = hashlib.sha256(chunk.encode("utf-8")).hexdigest()
             all_docs.append(
                 {
-                    "text": chunk,
+                    "text": anchored_chunk,
                     "embedding": emb,
                     "metadata": {
                         "source": file_path.name,
                         "path": str(file_path),
                         "type": "docs",
                         "format": file_path.suffix.lower().lstrip("."),
+                        "program_type": program_type,
                         "hasCode": "```" in chunk or re.search(r"\b(class|def|function|SELECT|INSERT)\b", chunk) is not None,
                         "chunk_index": idx,
                         "chunk_total": len(chunks),
                         "chunk_chars": len(chunk),
+                        "chunk_hash": chunk_hash,
                         "embedding_provider": "gemini",
                         "embedding_model": settings.GEMINI_EMBEDDING_MODEL,
                         "embedding_dimensions": settings.EMBEDDING_DIMENSIONS,
@@ -240,8 +323,6 @@ async def main(input_path: Path, chunk_size: int, overlap: int) -> None:
         print("[ingest] Nothing to insert.")
         return
 
-    db = await get_database()
-    collection = db[settings.KNOWLEDGE_BASE_COLLECTION]
     print(f"[ingest] Inserting {len(all_docs)} chunks into {settings.KNOWLEDGE_BASE_COLLECTION}...")
     await collection.insert_many(all_docs)
     print("[ingest] Done.")
