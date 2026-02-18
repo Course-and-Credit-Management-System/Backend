@@ -513,6 +513,7 @@ def _build_context_from_results(results: Sequence[Dict[str, Any]]) -> Tuple[str,
     """
     context_chunks: List[str] = []
     sources: List[Dict[str, Any]] = []
+    seen_pairs: set[tuple[str, str]] = set()
 
     for doc in results:
         text = doc.get("text") or ""
@@ -521,13 +522,26 @@ def _build_context_from_results(results: Sequence[Dict[str, Any]]) -> Tuple[str,
         if not isinstance(text, str) or not text.strip():
             continue
 
-        context_chunks.append(text.strip())
+        source = str(metadata.get("source") or doc.get("_id") or "").strip() or "unknown"
+        program_type = str(metadata.get("program_type") or "").strip()
+        chunk_idx = metadata.get("chunk_index")
+        chunk_total = metadata.get("chunk_total")
+        dedupe_key = (source, text.strip())
+        if dedupe_key in seen_pairs:
+            continue
+        seen_pairs.add(dedupe_key)
 
-        source = metadata.get("source")
+        chunk_label_parts = [f"Source: {source}"]
+        if program_type:
+            chunk_label_parts.append(f"Program: {program_type}")
+        if isinstance(chunk_idx, int) and isinstance(chunk_total, int):
+            chunk_label_parts.append(f"Chunk: {chunk_idx + 1}/{chunk_total}")
+        context_chunks.append(f"[{' | '.join(chunk_label_parts)}]\n{text.strip()}")
+
         score = doc.get("score") or doc.get("_score")
         source_entry: Dict[str, Any] = {
             "text": text,
-            "source": source or str(doc.get("_id", "")),
+            "source": source,
         }
         if isinstance(score, (int, float)):
             source_entry["score"] = float(score)
