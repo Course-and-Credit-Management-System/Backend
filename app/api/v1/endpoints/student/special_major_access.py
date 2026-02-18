@@ -8,8 +8,8 @@ router = APIRouter()
 FOUR_YEAR_MAJORS = ["SE", "KE", "BIS", "CSec", "HPC", "CN", "ES"]
 TRACKS = ["CS", "CT"]
 TRACK_MAJORS = {
-    "CS": ["SE", "KE", "BIS", "CSec"],
-    "CT": ["CN", "HPC", "ES"],
+    "CS": ["SE", "KE", "BIS"],
+    "CT": ["CSec"],
 }
 
 async def _get_col(db, names: list[str]):
@@ -215,6 +215,80 @@ async def special_major_select(payload: dict, current_user=Depends(get_current_u
     except Exception:
         pass
     return {"selected_major": major, "selected_track": track, "program_type": program_type}
+
+@router.post("/special-major/track", tags=["student"])
+async def special_major_select_track(payload: dict, current_user=Depends(get_current_user)):
+    track = str(payload.get("track", "")).strip().upper()
+    if track not in TRACKS:
+        raise HTTPException(status_code=422, detail="Invalid track")
+
+    db = await get_database()
+    col = await _get_col(db, ["StudentsProgress", "students_progress"])
+    users = await _get_col(db, ["Users", "users"])
+
+    udoc = await users.find_one({"user_id": current_user["user_id"]})
+    profile = (udoc or {}).get("student_profile") or {}
+    doc = await col.find_one({"$or": [{"student_id": current_user["user_id"]}, {"user_id": current_user["user_id"]}]}) or {}
+
+    ynum = _year_to_num(doc.get("current_year"))
+    snum = _semester_to_num(doc.get("current_semester"))
+    if ynum is None or snum is None:
+        py, ps = _parse_profile_current_year(profile.get("current_year"))
+        ynum = ynum if ynum is not None else py
+        snum = snum if snum is not None else ps
+
+    program_type = _derive_program_type(doc, profile)
+    if program_type != "5-year":
+        raise HTTPException(status_code=400, detail="Track selection is only available for 5-year program")
+
+    eligible, reason = _eligibility_special(program_type, ynum, snum)
+    if not eligible:
+        raise HTTPException(status_code=403, detail=reason or "Not eligible")
+
+    if doc.get("selected_major"):
+        raise HTTPException(status_code=400, detail="Track cannot be changed after major selection")
+
+    updates = {
+        "student_id": current_user["user_id"],
+        "user_id": current_user["user_id"],
+        "selected_track": track,
+        "program_type": program_type,
+        "program_duration": program_type,
+        "updated_at": __import__("datetime").datetime.utcnow(),
+    }
+
+    # Keep progress year/semester populated from profile when missing.
+    if not doc.get("current_year") or not doc.get("current_semester"):
+        py, ps = _parse_profile_current_year(profile.get("current_year"))
+        if py in (1, 2, 3, 4, 5) and not doc.get("current_year"):
+            updates["current_year"] = {
+                1: "First Year",
+                2: "Second Year",
+                3: "Third Year",
+                4: "Fourth Year",
+                5: "Fifth Year",
+            }[py]
+        if ps in (1, 2) and not doc.get("current_semester"):
+            updates["current_semester"] = {1: "First Semester", 2: "Second Semester"}[ps]
+
+    if "academic_year" not in doc:
+        updates["academic_year"] = ""
+
+    await col.update_one(
+        {"$or": [{"student_id": current_user["user_id"]}, {"user_id": current_user["user_id"]}]},
+        {"$set": updates},
+        upsert=True,
+    )
+
+    try:
+        await users.update_one(
+            {"user_id": current_user["user_id"]},
+            {"$set": {"student_profile.major_track": track}},
+        )
+    except Exception:
+        pass
+
+    return {"selected_track": track, "program_type": program_type}
 
 @router.post("/special-major/populate-from-profile", tags=["student"])
 async def special_major_populate_from_profile(current_user=Depends(get_current_user)):
