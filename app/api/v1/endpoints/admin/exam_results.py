@@ -51,13 +51,13 @@ async def import_exam_results_excel(
     for cell in ws[1]:
         headers.append(str(cell.value).strip().lower() if cell.value else "")
 
-    # Required columns: student_id, course_code, year, semester, exam_score
-    # Optional columns: section (for years 1-3), major (for years 3-5)
-    required = {"student_id", "course_code", "year", "semester", "exam_score"}
+    # Required columns for Enrollments collection: student_id, course_id, semesterAttend, scores
+    # Optional columns: is_retake, status, grade, points, reason
+    required = {"student_id", "course_id", "scores"}
     if not required.issubset(set(headers)):
         return {
             "success": False,
-            "message": f"Excel must include columns: {sorted(list(required))}. Optional: section, major"
+            "message": f"Excel must include columns: {sorted(list(required))}. Optional: semesterAttend, is_retake, status, grade, points, reason"
         }
 
     header_index = {h: i for i, h in enumerate(headers)}
@@ -75,50 +75,75 @@ async def import_exam_results_excel(
 
         try:
             student_id = str(row[header_index["student_id"]]).strip()
-            course_code = str(row[header_index["course_code"]]).strip()
-            year = int(row[header_index["year"]])
-            semester = int(row[header_index["semester"]])
-            exam_score = float(row[header_index["exam_score"]])
+            course_id = str(row[header_index["course_id"]]).strip()
+            scores = float(row[header_index["scores"]]) if row[header_index["scores"]] is not None else 0
 
-            # Get optional section and major
-            section = None
-            major = None
-            if "section" in header_index and row[header_index["section"]]:
-                section = str(row[header_index["section"]]).strip().upper()
-            if "major" in header_index and row[header_index["major"]]:
-                major = str(row[header_index["major"]]).strip().upper()
+            # Get optional fields
+            semester_attend = None
+            is_retake = False
+            status = "Enrolled"
+            grade = None
+            points = None
+            reason = None
 
-            # Validate year, section, major combination
-            section, major = validate_year_section_major(year, section, major)
+            if "semesterattend" in header_index and row[header_index["semesterattend"]]:
+                semester_attend = str(row[header_index["semesterattend"]]).strip()
+            else:
+                # Default to current semester if not provided
+                semester_attend = "New . 1st Year . First Sem"
 
-            # Validate semester
-            if semester not in [1, 2]:
-                raise ValueError(f"Semester must be 1 or 2, got {semester}")
+            if "is_retake" in header_index and row[header_index["is_retake"]] is not None:
+                is_retake = bool(row[header_index["is_retake"]])
 
-            grade, grade_point, status = score_to_grade(exam_score)
+            if "status" in header_index and row[header_index["status"]]:
+                status = str(row[header_index["status"]]).strip()
+
+            # Calculate grade and points from score if not provided
+            if scores is not None:
+                calculated_grade, calculated_points, calculated_status = score_to_grade(scores)
+                # Map "Probation" status to "Failed" for Enrollments collection compatibility
+                if calculated_status == "Probation":
+                    calculated_status = "Failed"
+                    
+                if status == "Enrolled":  # Use calculated status if default
+                    status = calculated_status
+                if grade is None:
+                    grade = calculated_grade
+                if points is None:
+                    points = calculated_points
+                # Auto-set is_retake based on calculated status
+                if calculated_status == "Failed":
+                    is_retake = True
+
+            if "grade" in header_index and row[header_index["grade"]]:
+                grade = str(row[header_index["grade"]]).strip()
+
+            if "points" in header_index and row[header_index["points"]] is not None:
+                points = float(row[header_index["points"]])
+
+            if "reason" in header_index and row[header_index["reason"]]:
+                reason = str(row[header_index["reason"]]).strip()
 
             doc = {
                 "student_id": student_id,
-                "course_code": course_code,
-                "year": year,
-                "semester": semester,
-                "section": section,
-                "major": major,
-                "exam_score": exam_score,
+                "course_id": course_id,
+                "semesterAttend": semester_attend,
+                "scores": scores,
                 "grade": grade,
-                "grade_point": grade_point,
+                "points": points,
                 "status": status,
+                "is_retake": is_retake,
+                "reason": reason,
             }
 
-            # Filter for upsert - unique by student, course, year, semester
+            # Filter for upsert - unique by student, course, semesterAttend
             filt = {
                 "student_id": student_id,
-                "course_code": course_code,
-                "year": year,
-                "semester": semester,
+                "course_id": course_id,
+                "semesterAttend": semester_attend,
             }
 
-            res = await db["ExamResults"].update_one(filt, {"$set": doc}, upsert=True)
+            res = await db["Enrollments"].update_one(filt, {"$set": doc}, upsert=True)
             if res.matched_count == 0:
                 inserted += 1
             else:
@@ -144,15 +169,32 @@ async def list_exam_results(
     section: str | None = None,
     db=Depends(get_db),
 ):
-    """List exam results. Returns all matching records (no limit)."""
+    """List exam results from Enrollments collection. Returns all matching records (no limit)."""
     query = {}
-    if course_code: query["course_code"] = course_code
-    if year is not None and year != 0: query["year"] = year
-    if semester is not None and semester != 0: query["semester"] = semester
-    if major: query["major"] = major
-    if section: query["section"] = section
+    
+    # Map course_code to course_id for Enrollments collection
+    if course_code: 
+        query["course_id"] = course_code
+    
+    # For Enrollments, we need to filter by semesterAttend which contains year/semester info
+    if year is not None and year != 0:
+        if semester is not None and semester != 0:
+            # Create regex pattern to match semesterAttend format like "2nd Year. Second Sem"
+            year_map = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th", 5: "5th"}
+            sem_map = {1: "First", 2: "Second"}
+            year_str = year_map.get(year, f"{year}th")
+            sem_str = sem_map.get(semester, f"{semester}")
+            query["semesterAttend"] = {"$regex": f"{year_str}.*{sem_str}", "$options": "i"}
+        else:
+            # Filter by year only
+            year_map = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th", 5: "5th"}
+            year_str = year_map.get(year, f"{year}th")
+            query["semesterAttend"] = {"$regex": year_str, "$options": "i"}
+    
+    # Note: Enrollments collection doesn't have major/section fields, so we'll ignore these filters
+    # but keep them for API compatibility
 
-    results = await db["ExamResults"].find(query).to_list(2000)
+    results = await db["Enrollments"].find(query).to_list(2000)
 
     out = []
     for r in results:
@@ -161,26 +203,25 @@ async def list_exam_results(
             {"user_id": r["student_id"]},
             {"_id": 0, "name": 1}
         )
-        r["student_name"] = user["name"] if user else None
-        # Ensure section/major are JSON-serializable (handle None, empty string)
-        if r.get("section") == "" or r.get("section") is None:
-            r["section"] = None
-        if r.get("major") == "" or r.get("major") is None:
-            r["major"] = None
-        # Normalize year/semester/section for malformed records so edit/save work
-        yr = r.get("year")
-        if yr is None:
-            r["year"] = 1
-            yr = 1
-        if r.get("semester") is None:
-            r["semester"] = 1
-        if 1 <= yr <= 3 and (r.get("section") is None or r.get("section") == ""):
-            r["section"] = "A"
-        if yr == 3 and (r.get("major") is None or r.get("major") == ""):
-            r["major"] = "CS"
-        if yr in [4, 5] and (r.get("major") is None or r.get("major") == ""):
-            r["major"] = "SE"
-        out.append(r)
+        
+        # Map Enrollments fields to ExamResults format for frontend compatibility
+        mapped_result = {
+            "student_id": r["student_id"],
+            "student_name": user["name"] if user else None,
+            "course_code": r["course_id"],  # Map course_id to course_code
+            "year": 1,  # Default value, not used in Enrollments
+            "semester": 1,  # Default value, not used in Enrollments
+            "section": None,  # Not available in Enrollments
+            "major": None,  # Not available in Enrollments
+            "exam_score": r.get("scores", 0),  # Map scores to exam_score
+            "grade": r.get("grade", "F"),
+            "grade_point": r.get("points", 0),  # Map points to grade_point
+            "status": r.get("status", "Failed"),
+            "is_retake": r.get("is_retake", False),  # Include the is_retake field
+            "semesterAttend": r.get("semesterAttend"),  # Include for debugging
+        }
+        
+        out.append(mapped_result)
 
     return out
 
@@ -192,47 +233,135 @@ async def delete_exam_result(
     semester: int | None = None,
     db=Depends(get_db),
 ):
-    """Delete exam result. year/semester optional for malformed records."""
-    filt: dict = {"student_id": student_id, "course_code": course_code}
+    """Delete exam result from Enrollments collection. year/semester optional for malformed records."""
+    enroll_col = await _get_col(db, ["Enrollments", "enrollments"])
+    
+    # Build filter for Enrollments collection
+    filt: dict = {"student_id": student_id, "course_id": course_code}
+    
+    # If year and semester are provided, try multiple semesterAttend formats
     if year is not None and semester is not None:
-        filt["year"] = year
-        filt["semester"] = semester
-
-    res = await db["ExamResults"].delete_one(filt)
-    if res.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Exam result not found")
+        year_map = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th", 5: "5th"}
+        sem_map = {1: "First", 2: "Second"}
+        year_str = year_map.get(year, f"{year}th")
+        sem_str = sem_map.get(semester, f"{semester}")
+        
+        # Try different semesterAttend formats we've seen in the data
+        possible_formats = [
+            f"{year_str} Year. {sem_str} Sem",
+            f"Old . {year_str} Year . {sem_str} Sem",
+            f"New . {year_str} Year . {sem_str} Sem",
+            f"{year_str} Year.{sem_str} Sem",
+            f"{year_str} Year . {sem_str} Sem"
+        ]
+        
+        for semester_attend in possible_formats:
+            filt["semesterAttend"] = semester_attend
+            res = await enroll_col.delete_one(filt)
+            if res.deleted_count > 0:
+                return {"success": True}
+        
+        # If none of the formats worked, try without semesterAttend
+        filt_partial = {"student_id": student_id, "course_id": course_code}
+        res = await enroll_col.delete_one(filt_partial)
+        if res.deleted_count == 0:
+            raise HTTPException(status_code=404, detail="Exam result not found")
+    else:
+        # Delete without semester filter
+        res = await enroll_col.delete_one(filt)
+        if res.deleted_count == 0:
+            raise HTTPException(status_code=404, detail="Exam result not found")
 
     return {"success": True}
 
 
+async def _get_col(db, names: list):
+    cols = await db.list_collection_names()
+    for n in names:
+        if n in cols:
+            return db[n]
+    return db[names[0]]
+
+
 @router.post("", response_model=ExamResultOut)
 async def upsert_exam_result(payload: ExamResultUpsertIn, db=Depends(get_db)):
-    grade, grade_point, status = score_to_grade(payload.exam_score)
+    try:
+        grade, grade_point, status = score_to_grade(payload.exam_score)
 
-    # ---- find student name ----
-    user_doc = await db["Users"].find_one({"user_id": payload.student_id})
-    student_name = user_doc.get("name") if user_doc else None
+        # Map "Probation" status to "Failed" for Enrollments collection compatibility
+        if status == "Probation":
+            status = "Failed"
 
-    doc = {
-        **payload.model_dump(),
-        "student_name": student_name,
-        "grade": grade,
-        "grade_point": grade_point,
-        "status": status,
-    }
+        users_col = await _get_col(db, ["Users", "users"])
+        enroll_col = await _get_col(db, ["Enrollments", "enrollments"])
 
-    # Filter for upsert - unique by student, course, year, semester
-    filt = {
-        "student_id": payload.student_id,
-        "course_code": payload.course_code,
-        "year": payload.year,
-        "semester": payload.semester,
-    }
+        user_doc = await users_col.find_one({"user_id": payload.student_id})
+        student_name = (user_doc or {}).get("name")
 
-    res = await db["ExamResults"].update_one(filt, {"$set": doc}, upsert=False)
-    if res.matched_count == 0:
-        # Handle malformed records that lack year/semester
-        filt_partial = {"student_id": payload.student_id, "course_code": payload.course_code}
-        await db["ExamResults"].update_one(filt_partial, {"$set": doc}, upsert=False)
+        # Create semesterAttend string from year and semester
+        year_map = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th", 5: "5th"}
+        sem_map = {1: "First", 2: "Second"}
+        year_str = year_map.get(payload.year, f"{payload.year}th")
+        sem_str = sem_map.get(payload.semester, f"{payload.semester}")
+        semester_attend = f"{year_str} Year. {sem_str} Sem"
 
-    return doc
+        # Map to Enrollments collection format
+        doc = {
+            "student_id": payload.student_id,
+            "course_id": payload.course_code,  # Map course_code to course_id
+            "semesterAttend": semester_attend,
+            "status": status,
+            "grade": grade,
+            "points": grade_point,  # Map grade_point to points
+            "scores": payload.exam_score,  # Map exam_score to scores
+            "is_retake": status == "Failed",  # Set to True if student failed
+        }
+
+        # Filter for upsert - unique by student, course, semesterAttend
+        filt = {
+            "student_id": payload.student_id,
+            "course_id": payload.course_code,
+            "semesterAttend": semester_attend,
+        }
+
+        # Try to find existing record first
+        existing_doc = await enroll_col.find_one({
+            "student_id": payload.student_id,
+            "course_id": payload.course_code
+        })
+        
+        if existing_doc:
+            # Update existing record, preserve is_retake if already True, otherwise set based on status
+            current_is_retake = existing_doc.get("is_retake", False)
+            # If student failed, mark as retake (or keep existing retake status)
+            new_is_retake = current_is_retake or (status == "Failed")
+            
+            doc["is_retake"] = new_is_retake
+            res = await enroll_col.update_one(
+                {"_id": existing_doc["_id"]},
+                {"$set": doc}
+            )
+        else:
+            # Create new record
+            res = await enroll_col.insert_one(doc)
+
+        # Map back to ExamResultOut format for response
+        response_doc = {
+            "student_id": payload.student_id,
+            "student_name": student_name,
+            "course_code": payload.course_code,
+            "year": payload.year,
+            "semester": payload.semester,
+            "section": payload.section,
+            "major": payload.major,
+            "exam_score": payload.exam_score,
+            "grade": grade,
+            "grade_point": grade_point,
+            "status": status,
+        }
+
+        return response_doc
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Save failed: {str(e)[:200]}")
