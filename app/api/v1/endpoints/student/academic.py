@@ -168,14 +168,14 @@ async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas
     total_points = 0.0
     
     for key, results in semester_groups.items():
-        # Calculate points only from passed subjects, but include all in denominator
+        # Calculate semester GPA using correct formula: grade points earned / credits earned
         passed_results = [r for r in results if r.get('status') not in ['Failed', 'Retake'] and r.get('grade') != 'F']
-        passed_points = sum(2.0 if r.get('status') == 'Passed' and r.get('grade') in ['F', 'D-', 'D', 'D+'] else float(r.get('grade_point', 0)) for r in passed_results)
-        semester_credits = len(passed_results) * 3  # Only passed subjects count for credits
-        semester_gpa = passed_points / len(results) if results else 0.0  # All subjects in denominator
+        semester_credits = len(passed_results) * 3  # Only passed courses count for credits
+        semester_points = sum(calculate_course_points(apply_retake_grade_logic(r.get('grade', ''), r.get('status', ''), r.get('is_retake', False)), 3) for r in passed_results)
+        semester_gpa = calculate_gpa(semester_points, semester_credits)
         
         total_credits += semester_credits
-        total_points += passed_points
+        total_points += semester_points
         
         # Extract academic year and semester plain
         academic_year = key.split(', ')[0]
@@ -202,15 +202,15 @@ async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas
                     for r in results
                 ],
                 total_credit_unit=semester_credits,
-                total_grade_points=passed_points,
+                total_grade_points=semester_points,
                 gpa=semester_gpa,
             )
         )
     
-    # Calculate overall CGPA (points from passed subjects, denominator includes all subjects)
-    passed_exam_records = [r for r in exam_records if r.get('status') not in ['Failed', 'Retake'] and r.get('grade') != 'F']
-    passed_points = sum(calculate_course_points(apply_retake_grade_logic(r.get('grade', ''), r.get('status', ''), r.get('is_retake', False)), 3) for r in passed_exam_records)
-    cgpa = passed_points / len(exam_records) if exam_records else 0.0
+    # Calculate overall CGPA using the correct formula: total grade points earned / total credits earned
+    # Only include passed/completed courses in both numerator and denominator
+    # Use the same totals that were accumulated from semester calculations
+    cgpa = calculate_gpa(total_points, total_credits)
     
     return schemas.CompleteAcademicRecord(
         student=schemas.StudentProfile(
