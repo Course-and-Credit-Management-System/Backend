@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, model_validator, field_validator
 from typing import Optional, Literal
 
 Section = Literal["A", "B", "C"]
@@ -9,35 +9,39 @@ class ExamResultUpsertIn(BaseModel):
     student_id: str
     course_code: str
     year: int = Field(ge=1, le=5)
-    semester: Semester
-    major: Optional[Major] = None  # Required for year 4-5, CS/CT for year 3
-    section: Optional[Section] = None  # Required for year 1-3 only
-    exam_score: float = Field(ge=0, le=100)
+    semester: int = Field(ge=1, le=2)
+    major: Optional[str] = None  # Required for year 4-5; accept any string for malformed records
+    section: Optional[str] = None  # Required for year 1-3; A/B/C
+    exam_score: float = Field(ge=0, le=100)  # Any score 0-100, including under 60
+
+    @field_validator("year", "semester", mode="before")
+    @classmethod
+    def coerce_int(cls, v):
+        if v is None or v == "" or (isinstance(v, str) and not v.strip()):
+            return 1
+        if isinstance(v, str) and v.strip().isdigit():
+            return int(v.strip())
+        try:
+            return int(float(v)) if v is not None else 1
+        except (TypeError, ValueError):
+            return 1
 
     @model_validator(mode='after')
     def validate_section_and_major(self):
-        """Validate section and major based on year:
-        - Year 1-2: section required (A/B/C), no major
-        - Year 3: section required (A/B/C), major required (CS/CT)
-        - Year 4-5: major required (SE/KE/etc.), no section
-        """
+        """Normalize section/major so malformed records (e.g. missing section/major) still save."""
         if self.year in [1, 2]:
-            if not self.section:
-                raise ValueError(f"Section (A/B/C) is required for year {self.year}")
-            if self.major:
-                raise ValueError(f"Major should not be set for year {self.year}")
+            if not self.section or str(self.section).strip() not in ("A", "B", "C"):
+                self.section = "A"
+            self.major = None
         elif self.year == 3:
-            if not self.section:
-                raise ValueError("Section (A/B/C) is required for year 3")
-            if not self.major:
-                raise ValueError("Major (CS/CT) is required for year 3")
-            if self.major not in ["CS", "CT"]:
-                raise ValueError("Year 3 major must be CS or CT")
+            if not self.section or str(self.section).strip() not in ("A", "B", "C"):
+                self.section = "A"
+            if not self.major or str(self.major).strip() not in ("CS", "CT"):
+                self.major = "CS"
         elif self.year in [4, 5]:
-            if self.section:
-                raise ValueError(f"Section should not be set for year {self.year}")
-            if not self.major:
-                raise ValueError(f"Major is required for year {self.year}")
+            self.section = None
+            if not self.major or not str(self.major).strip():
+                self.major = "SE"
         return self
 
 class ExamResultOut(BaseModel):

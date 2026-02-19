@@ -612,15 +612,16 @@ async def _do_update_student(student_id: str, student_update: StudentUpdate):
         set_updates["email"] = update_data["email"]
     if "major" in update_data:
         sp["major_id"] = update_data["major"]
+        # Also update students_progress.selected_major for consistency
+        progress_col = await _get_col(db, ["students_progress", "StudentsProgress"])
+        await progress_col.update_one(
+            {"student_id": student_id},
+            {"$set": {"selected_major": update_data["major"]}},
+            upsert=True
+        )
     if "section" in update_data:
-        curr = sp.get("current_year")
-        yr = update_data.get("year")
-        if yr is None and curr:
-            try:
-                yr = parse_academic_year(curr)[0]
-            except Exception:
-                yr = 1
-        sp["section"] = update_data["section"] if 1 <= (yr or 1) <= 3 else None
+        # Allow section updates for all years, not just 1-3
+        sp["section"] = update_data["section"]
     if "year" in update_data or "semester" in update_data:
         curr = sp.get("current_year")
         if curr:
