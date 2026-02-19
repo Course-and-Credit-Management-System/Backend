@@ -124,6 +124,7 @@ def _map_student_record(data: dict) -> schemas.CompleteAcademicRecord:
 async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas.CompleteAcademicRecord:
     db = await get_database()
     exam_results = await _get_col(db, ["ExamResults", "exam_results"])
+    enrollments = await _get_col(db, ["Enrollments", "enrollments"])
     users = await _get_col(db, ["Users", "users"])
     
     # Get user info
@@ -139,6 +140,21 @@ async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas
     # Get exam results for this student
     exam_query = {"student_id": user_id} if user_id else {}
     exam_records = await exam_results.find(exam_query).to_list(None)
+    
+    # Get enrollment data for retake information
+    enrollment_query = {"student_id": user_id, "is_retake": True} if user_id else {"is_retake": True}
+    enrollment_records = await enrollments.find(enrollment_query).to_list(None)
+    
+    # Create a lookup map for retake information
+    retake_lookup = {}
+    for enrollment in enrollment_records:
+        course_id = enrollment.get("course_id") or enrollment.get("course_code")
+        if course_id:
+            retake_lookup[course_id] = {
+                "is_retake": enrollment.get("is_retake", False),
+                "status": enrollment.get("status", ""),
+                "semester": enrollment.get("semesterAttend", "")
+            }
     
     if not exam_records:
         return get_mock_academic_record()
@@ -164,17 +180,65 @@ async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas
     
     # Convert to semester structure with GPA calculations
     semesters_out = []
-    total_credits = 0
+    total_credits_passed = 0  # For display purposes (only passed credits)
+    total_credits_all = 0     # Total credits from all courses (passed + failed)
     total_points = 0.0
     
     for key, results in semester_groups.items():
-        # Calculate semester GPA using correct formula: grade points earned / credits earned
-        passed_results = [r for r in results if r.get('status') not in ['Failed', 'Retake'] and r.get('grade') != 'F']
-        semester_credits = len(passed_results) * 3  # Only passed courses count for credits
-        semester_points = sum(calculate_course_points(apply_retake_grade_logic(r.get('grade', ''), r.get('status', ''), r.get('is_retake', False)), 3) for r in passed_results)
-        semester_gpa = calculate_gpa(semester_points, semester_credits)
+        # Process results with retake information and credit limit
+        processed_results = []
+        semester_credits_passed = 0  # Credits from passed courses only
+        semester_credits_total = 0   # Credits from all courses (passed + failed)
+        semester_points = 0.0
         
-        total_credits += semester_credits
+        for r in results:
+            course_code = r.get('course_code', '')
+            # Check if this course is a retake from enrollment data
+            retake_info = retake_lookup.get(course_code, {})
+            is_retake = retake_info.get('is_retake', False)
+            enrollment_status = retake_info.get('status', '')
+            
+            # Apply retake logic: if enrollment shows passed status, use static C grade
+            final_grade = r.get('grade', '')
+            final_status = r.get('status', '')
+            
+            if is_retake and enrollment_status in ['Passed', 'Completed']:
+                final_grade = 'C'  # Static C grade for passed retakes
+                final_status = 'Passed'
+            
+            # Create processed result with updated grade and status
+            processed_result = r.copy()
+            processed_result['final_grade'] = final_grade
+            processed_result['final_status'] = final_status
+            
+            # Count all courses for total credits (passed + failed)
+            course_credits = 3
+            semester_credits_total += course_credits
+            
+            # Only passed courses contribute grade points and count for passed credits
+            if final_status not in ['Failed', 'Retake'] and final_grade != 'F':
+                if semester_credits_passed < 24:  # Enforce 24 credit limit for passed courses
+                    semester_credits_passed += course_credits
+                    grade_points = calculate_course_points(final_grade, course_credits)
+                    semester_points += grade_points
+                    processed_result['counted_credits'] = course_credits
+                    processed_result['grade_points'] = grade_points
+                else:
+                    # Mark as not counted if credit limit exceeded
+                    processed_result['counted_credits'] = 0
+                    processed_result['grade_points'] = 0
+            else:
+                # Failed courses: 0 grade points but still count in total credits
+                processed_result['counted_credits'] = 0
+                processed_result['grade_points'] = 0
+            
+            processed_results.append(processed_result)
+        
+        # Calculate semester GPA: grade points from passed courses / total credits from all courses
+        semester_gpa = calculate_gpa(semester_points, semester_credits_total)
+        
+        total_credits_passed += semester_credits_passed  # For display purposes (only passed credits)
+        total_credits_all += semester_credits_total   # Total credits from all courses
         total_points += semester_points
         
         # Extract academic year and semester plain
@@ -189,28 +253,27 @@ async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas
                     schemas.StudentResult(
                         course_code=r.get('course_code', ''),
                         course_title=r.get('course_code', ''),  # Using course_code as title
-                        grade=apply_retake_grade_logic(r.get('grade', ''), r.get('status', ''), r.get('is_retake', False)),
+                        grade=r.get('final_grade', ''),
                         points=float(r.get('grade_point', 0)),
-                        status=r.get('status', 'Unknown'),
-                        result_tag=get_result_tag(apply_retake_grade_logic(r.get('grade', ''), r.get('status', ''), r.get('is_retake', False))),
+                        status=r.get('final_status', 'Unknown'),
+                        result_tag=get_result_tag(r.get('final_grade', '')),
                         review_status=r.get('review_status', 'None'),
                         lecture_hours=2,
                         tda_hours=2,
-                        credit_unit=3 if r.get('status') in ['Completed', 'Passed'] else 0,
-                        grade_points_earned=calculate_course_points(apply_retake_grade_logic(r.get('grade', ''), r.get('status', ''), r.get('is_retake', False)), 3) if r.get('status') in ['Completed', 'Passed'] else 0.0
+                        credit_unit=3,  # All courses have 3 credits for GPA calculation
+                        grade_points_earned=r.get('grade_points', 0.0)
                     )
-                    for r in results
+                    for r in processed_results
                 ],
-                total_credit_unit=semester_credits,
+                total_credit_unit=semester_credits_total,  # Total credits from all courses (passed + failed)
                 total_grade_points=semester_points,
                 gpa=semester_gpa,
             )
         )
     
-    # Calculate overall CGPA using the correct formula: total grade points earned / total credits earned
-    # Only include passed/completed courses in both numerator and denominator
-    # Use the same totals that were accumulated from semester calculations
-    cgpa = calculate_gpa(total_points, total_credits)
+    # Calculate overall CGPA using the correct formula: total grade points earned / total credits from all courses
+    # Grade points only from passed courses, but credits from all courses (passed + failed)
+    cgpa = calculate_gpa(total_points, total_credits_all)
     
     return schemas.CompleteAcademicRecord(
         student=schemas.StudentProfile(
@@ -220,7 +283,7 @@ async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas
             dob=user_doc.get('dob') or ''
         ),
         academic_summary=schemas.AcademicSummary(
-            total_credits_earned=total_credits,
+            total_credits_earned=total_credits_passed,  # Display only passed credits
             total_grade_points=total_points,
             cgpa=cgpa,
             semesters=semesters_out,
