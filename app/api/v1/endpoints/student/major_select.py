@@ -243,6 +243,51 @@ async def major_state(current_user=Depends(get_current_user)):
     doc["__profile_current_year_raw"] = profile.get("current_year")
     doc["__profile_program_duration"] = profile.get("program_duration")
     doc["__profile_major_track"] = profile.get("major_track")
+    # Auto-populate selected_major/selected_track for 5-year Old students in 4Y2 & all 5Y
+    # using Users.major_id and Users.major_track, matching Special Major Access behavior.
+    try:
+        ynum = _year_to_num(doc.get("current_year"))
+        snum = _semester_to_num(doc.get("current_semester"))
+        if ynum is None or snum is None:
+            py, ps, yl, sl = _parse_profile_current_year(profile.get("current_year"))
+            ynum = ynum if ynum is not None else py
+            snum = snum if snum is not None else ps
+            # normalize labels if missing
+            if yl and not doc.get("current_year"):
+                doc["current_year"] = yl
+            if sl and not doc.get("current_semester"):
+                doc["current_semester"] = sl
+        program_type_eff = doc.get("program_type") or (profile.get("program_duration") if profile.get("program_duration") in ("4-year","5-year") else None) or _profile_program_type(profile.get("current_year")) or "4-year"
+        must_lock_from_profile = program_type_eff == "5-year" and ((ynum == 4 and snum == 2) or (ynum == 5))
+        profile_major = str(profile.get("major_id") or "").strip()
+        profile_track = str(profile.get("major_track") or "").strip().upper()
+        if must_lock_from_profile and profile_major:
+            updates = {
+                "student_id": current_user["user_id"],
+                "user_id": current_user["user_id"],
+                "selected_major": profile_major,
+                "selected_track": profile_track or (doc.get("selected_track") or None),
+                "program_type": "5-year",
+                "program_duration": "5-year",
+                "updated_at": __import__("datetime").datetime.utcnow(),
+            }
+            if not doc.get("selected_major_at"):
+                updates["selected_major_at"] = __import__("datetime").datetime.utcnow()
+            if doc.get("current_year"):
+                updates["current_year"] = doc.get("current_year")
+            if doc.get("current_semester"):
+                updates["current_semester"] = doc.get("current_semester")
+            if not doc.get("academic_year"):
+                updates["academic_year"] = ""
+            await col.update_one(
+                {"$or": [{"student_id": current_user["user_id"]}, {"user_id": current_user["user_id"]}]},
+                {"$set": updates},
+                upsert=True
+            )
+            # refresh doc for accurate state after upsert
+            doc = await col.find_one({"$or": [{"student_id": current_user["user_id"]}, {"user_id": current_user["user_id"]}]})
+    except Exception:
+        pass
     state = {
         "program_type": doc.get("program_type"),
         "academic_year": doc.get("academic_year"),

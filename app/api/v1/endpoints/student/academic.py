@@ -355,6 +355,7 @@ async def get_degree_audit(current_user=Depends(get_current_user)):
     db = await get_database()
     users = await _get_col(db, ["Users", "users"])
     enrollments = await _get_col(db, ["Enrollments", "enrollments"])
+    exam_results = await _get_col(db, ["ExamResults", "exam_results"])
     courses = await _get_col(db, ["Courses", "courses"])
     majors = await _get_col(db, ["majors", "Majors"])
 
@@ -457,10 +458,64 @@ async def get_degree_audit(current_user=Depends(get_current_user)):
     if general_ed_required <= 0:
         general_ed_required = 0.0
 
+    # ---------------------------
+    # Additional course-count progress bars (Core, Elective, Major, Overall)
+    # Data source:
+    #  - Passed courses from ExamResults (status not Failed/Retake and grade != 'F')
+    #  - Total courses from Courses by type
+    # ---------------------------
+    # Total courses by type
+    total_core_courses = await courses.count_documents({"type": {"$in": ["Core", "core"]}})
+    total_elective_courses = await courses.count_documents({"type": {"$in": ["Elective", "elective"]}})
+    total_major_courses = await courses.count_documents({"type": {"$in": ["Major", "major"]}})
+
+    # Passed unique course codes for the current student
+    exam_query = {"student_id": user_id} if user_id else {}
+    exam_recs = await exam_results.find(exam_query).to_list(None)
+    def _is_passed(rec: dict) -> bool:
+        st = (rec.get("status") or "").strip()
+        gr = (rec.get("grade") or "").strip()
+        return (st not in ["Failed", "Retake"]) and (gr.upper() != "F")
+    passed_codes = {str(r.get("course_code") or "").strip() for r in exam_recs if _is_passed(r) and r.get("course_code")}
+    passed_codes = {c for c in passed_codes if c}
+
+    passed_core_courses = 0
+    passed_elective_courses = 0
+    passed_major_courses = 0
+    if passed_codes:
+        # Bulk load courses by code
+        course_docs = await courses.find({"course_code": {"$in": list(passed_codes)}}).to_list(None)
+        # Some datasets might store _id equal to code; include fallback
+        missing_codes = passed_codes - {c.get("course_code") for c in course_docs if c.get("course_code")}
+        if missing_codes:
+            fallback_docs = await courses.find({"_id": {"$in": list(missing_codes)}}).to_list(None)
+            course_docs.extend(fallback_docs)
+        for c in course_docs:
+            ctype = str(c.get("type") or "").strip().lower()
+            if ctype == "core":
+                passed_core_courses += 1
+            elif ctype == "elective":
+                passed_elective_courses += 1
+            elif ctype == "major":
+                passed_major_courses += 1
+
+    # Overall counts and percentages
+    total_courses = int(total_core_courses) + int(total_elective_courses) + int(total_major_courses)
+    total_passed_courses = int(passed_core_courses) + int(passed_elective_courses) + int(passed_major_courses)
+    def pct(num: int, den: int) -> float:
+        return round((num / den) * 100.0, 2) if den > 0 else 0.0
+    progress_bars = [
+        {"label": "Core", "percentage": pct(passed_core_courses, int(total_core_courses)), "completed": int(passed_core_courses), "total": int(total_core_courses)},
+        {"label": "Elective", "percentage": pct(passed_elective_courses, int(total_elective_courses)), "completed": int(passed_elective_courses), "total": int(total_elective_courses)},
+        {"label": "Major", "percentage": pct(passed_major_courses, int(total_major_courses)), "completed": int(passed_major_courses), "total": int(total_major_courses)},
+        {"label": "Overall", "percentage": pct(int(total_passed_courses), int(total_courses)), "completed": int(total_passed_courses), "total": int(total_courses)},
+    ]
+
     return {
         "core_credits": {"earned": round(earn_core, 2), "required": round(core_required, 2)},
         "elective_credits": {"earned": round(earn_major_elec, 2), "required": round(major_electives_required, 2)},
         "major_specific": {"earned": round(earn_gen_ed, 2), "required": round(general_ed_required, 2)},
+        "progress_bars": progress_bars,
     }
 
 @router.get("/status", response_model=schemas.AcademicStatus)
@@ -886,3 +941,9 @@ async def get_degree_progress(current_user=Depends(get_current_user)):
         },
         "passed_course_details": passed_enrollments
     }
+
+
+
+
+
+

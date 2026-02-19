@@ -29,6 +29,9 @@ class DegreeAudit(BaseModel):
     core_credits: CreditProgress
     elective_credits: CreditProgress
     major_specific: CreditProgress
+    # Optional course-count progress bars: Core / Elective / Major / Overall
+    # Each item: {"label": "...", "percentage": 0-100, "completed": int, "total": int}
+    progress_bars: Optional[List[Dict]] = None
 
 # Academic Status
 class AcademicStatus(BaseModel):

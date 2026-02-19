@@ -97,19 +97,85 @@ async def get_progress(current_user=Depends(get_current_user)):
     col = await _get_col(db, ["StudentsProgress", "students_progress"])
     doc = await col.find_one({"student_id": current_user["user_id"]})
     if not doc:
-        try:
-            record = await fetch_latest_academic_record(current_user["user_id"])
-            derived = _derive_enrollment_year(record)
-            program_type = _parse_program_type(derived or "")
-            return {
-                "student_id": current_user["user_id"],
-                "academic_year": derived or "",
-                "program_type": program_type,
-                "program_rule_note": _program_rule_note(program_type),
-            }
-        except Exception:
-            return {}
+        # No explicit StudentsProgress doc yet — infer from Users profile and/or academic records
+        users = await _get_col(db, ["Users", "users"])
+        udoc = await users.find_one({"user_id": current_user["user_id"]}) or {}
+        profile = (udoc.get("student_profile") or {})
+        # 1) Direct hint from profile.program_duration (preferred)
+        program_type = profile.get("program_duration") or None
+        # 2) Fallback to parsing 'current_year' text for "new"/"old" tokens
+        if not program_type:
+            _, _, pt_hint = _parse_profile_current(profile.get("current_year"))
+            if pt_hint:
+                program_type = pt_hint
+        # 3) Fallback to admission_academic_year
+        if not program_type:
+            program_type = _parse_program_type(profile.get("admission_academic_year") or "")
+        # 4) Final fallback to derived enrollment year from academic record
+        derived = None
+        if not program_type or not isinstance(program_type, str):
+            try:
+                record = await fetch_latest_academic_record(current_user["user_id"])
+                derived = _derive_enrollment_year(record)
+                program_type = _parse_program_type(derived or "")
+            except Exception:
+                program_type = "4-year"
+        if derived is None:
+            # If we didn't attempt/need to derive, try to surface admission year if present
+            derived = profile.get("admission_academic_year") or ""
+        return {
+            "student_id": current_user["user_id"],
+            "academic_year": derived or "",
+            "program_type": "5-year" if str(program_type).strip().lower().startswith("5") else "4-year",
+            "program_rule_note": _program_rule_note("5-year" if str(program_type).strip().lower().startswith("5") else "4-year"),
+        }
+    # Harmonize with Users flag every time to ensure UI reflects Old/New accurately
+    users = await _get_col(db, ["Users", "users"])
+    udoc = await users.find_one({"user_id": current_user["user_id"]}) or {}
+    profile = (udoc.get("student_profile") or {})
+
+    # Detect program type from Users in a robust way
+    def _detect_from_user(p: dict) -> str | None:
+        # 1) explicit duration values like "4-year"/"5-year"
+        dur = (p.get("program_duration") or p.get("program") or p.get("program_type") or "")
+        if isinstance(dur, str) and dur:
+            s = dur.strip().lower()
+            if "5" in s or "five" in s or "5-year" in s:
+                return "5-year"
+            if "4" in s or "four" in s or "4-year" in s:
+                return "4-year"
+            if "old" in s:
+                return "5-year"
+            if "new" in s:
+                return "4-year"
+        # 2) boolean flags
+        if bool(p.get("is_old", False)):
+            return "5-year"
+        if bool(p.get("is_new", False)):
+            return "4-year"
+        # 3) parse textual current_year
+        _, _, pt_hint = _parse_profile_current(p.get("current_year"))
+        if pt_hint:
+            return pt_hint
+        # 4) admission year heuristic
+        adm = p.get("admission_academic_year") or ""
+        if adm:
+            return _parse_program_type(adm)
+        return None
+
+    effective_pt = _detect_from_user(profile) or (doc or {}).get("program_type") or "4-year"
+    effective_pt = "5-year" if str(effective_pt).strip().lower().startswith("5") or str(effective_pt).strip().lower() == "old" else "4-year"
+    if not doc:
+        return {
+            "student_id": current_user["user_id"],
+            "academic_year": (profile.get("admission_academic_year") or ""),
+            "program_type": effective_pt,
+            "program_rule_note": _program_rule_note(effective_pt),
+        }
+    # Merge and return
     doc["_id"] = str(doc.get("_id"))
+    doc["program_type"] = effective_pt
+    doc["program_rule_note"] = _program_rule_note(effective_pt)
     return doc
 
 @router.post("/progress/academic-year", tags=["student"])
