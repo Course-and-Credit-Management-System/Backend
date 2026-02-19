@@ -125,6 +125,7 @@ async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas
     db = await get_database()
     exam_results = await _get_col(db, ["ExamResults", "exam_results"])
     enrollments = await _get_col(db, ["Enrollments", "enrollments"])
+    courses = await _get_col(db, ["Courses", "courses"])
     users = await _get_col(db, ["Users", "users"])
     
     # Get user info
@@ -154,6 +155,18 @@ async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas
                 "is_retake": enrollment.get("is_retake", False),
                 "status": enrollment.get("status", ""),
                 "semester": enrollment.get("semesterAttend", "")
+            }
+    
+    # Create a lookup map for course information
+    course_lookup = {}
+    async for course in courses.find({}):
+        course_code = course.get("course_code") or course.get("_id")
+        if course_code:
+            course_lookup[course_code] = {
+                "title": course.get("title", ""),
+                "credits": course.get("credits", 3),
+                "type": course.get("type", ""),
+                "department": course.get("department", "")
             }
     
     if not exam_records:
@@ -252,7 +265,7 @@ async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas
                 results=[
                     schemas.StudentResult(
                         course_code=r.get('course_code', ''),
-                        course_title=r.get('course_code', ''),  # Using course_code as title
+                        course_title=course_lookup.get(r.get('course_code', ''), {}).get('title', r.get('course_code', '')),  # Use real course title
                         grade=r.get('final_grade', ''),
                         points=float(r.get('grade_point', 0)),
                         status=r.get('final_status', 'Unknown'),
