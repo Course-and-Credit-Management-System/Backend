@@ -10,7 +10,7 @@ from bson import ObjectId
 from app.services.pdf_service import generate_certificate_pdf, generate_complete_transcript_pdf
 from app.services.grade_service import (
     calculate_course_points, calculate_gpa, calculate_academic_summary, 
-    get_result_tag
+    get_result_tag, apply_retake_grade_logic
 )
 from app.api.v1.deps.auth import get_current_user
 from app.services.enrollment_settings_service import get_effective_enrollment_settings_for_user
@@ -189,15 +189,15 @@ async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas
                     schemas.StudentResult(
                         course_code=r.get('course_code', ''),
                         course_title=r.get('course_code', ''),  # Using course_code as title
-                        grade='C' if r.get('status') == 'Passed' and r.get('grade') in ['F', 'D-', 'D', 'D+'] else r.get('grade', ''),
+                        grade=apply_retake_grade_logic(r.get('grade', ''), r.get('status', ''), r.get('is_retake', False)),
                         points=float(r.get('grade_point', 0)),
                         status=r.get('status', 'Unknown'),
-                        result_tag=get_result_tag(r.get('grade', '')),
+                        result_tag=get_result_tag(apply_retake_grade_logic(r.get('grade', ''), r.get('status', ''), r.get('is_retake', False))),
                         review_status=r.get('review_status', 'None'),
                         lecture_hours=2,
                         tda_hours=2,
                         credit_unit=3 if r.get('status') in ['Completed', 'Passed'] else 0,
-                        grade_points_earned=2.0 if r.get('status') == 'Passed' and r.get('grade') in ['F', 'D-', 'D', 'D+'] else float(r.get('grade_point', 0))
+                        grade_points_earned=calculate_course_points(apply_retake_grade_logic(r.get('grade', ''), r.get('status', ''), r.get('is_retake', False)), 3) if r.get('status') in ['Completed', 'Passed'] else 0.0
                     )
                     for r in results
                 ],
@@ -209,7 +209,7 @@ async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas
     
     # Calculate overall CGPA (points from passed subjects, denominator includes all subjects)
     passed_exam_records = [r for r in exam_records if r.get('status') not in ['Failed', 'Retake'] and r.get('grade') != 'F']
-    passed_points = sum(2.0 if r.get('status') == 'Passed' and r.get('grade') in ['F', 'D-', 'D', 'D+'] else float(r.get('grade_point', 0)) for r in passed_exam_records)
+    passed_points = sum(calculate_course_points(apply_retake_grade_logic(r.get('grade', ''), r.get('status', ''), r.get('is_retake', False)), 3) for r in passed_exam_records)
     cgpa = passed_points / len(exam_records) if exam_records else 0.0
     
     return schemas.CompleteAcademicRecord(
@@ -513,17 +513,23 @@ async def get_current_courses(current_user=Depends(get_current_user)):
             if not course:
                 course = await courses.find_one({"course_code": course_id_or_code})
         
+        course_credits = (course or {}).get("credits", enrollment.get("credits", 3))
+        
+        # Check if adding this course would exceed 24 credit limit
+        if total_credits + course_credits > 24:
+            continue  # Skip this course to enforce credit limit
+        
         course_data = {
             "code": (course or {}).get("course_code", course_id_or_code),
             "title": (course or {}).get("title", course_id_or_code),
-            "credits": (course or {}).get("credits", enrollment.get("credits", 3)),
+            "credits": course_credits,
             "instructor": (course or {}).get("instructor", "TBA"),
             "location": (course or {}).get("room", "TBA"),
             "is_retake": enrollment.get("is_retake", False),
             "tag": "Core",
         }
         current_courses.append(course_data)
-        total_credits += course_data["credits"]
+        total_credits += course_credits
     
     # Return the structure expected by frontend
     return {
