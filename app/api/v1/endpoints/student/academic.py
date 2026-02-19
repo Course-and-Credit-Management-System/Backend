@@ -288,6 +288,14 @@ async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas
     # Grade points only from passed courses, but credits from all courses (passed + failed)
     cgpa = calculate_gpa(total_points, total_credits_all)
     
+    # Debug logging for final calculation
+    print(f"Final CGPA Calculation:")
+    print(f"  Total Grade Points: {total_points}")
+    print(f"  Total Credits (All): {total_credits_all}")
+    print(f"  CGPA: {cgpa}")
+    print(f"  Total Credits (Passed): {total_credits_passed}")
+    print(f"  Number of Semesters: {len(semesters_out)}")
+    
     return schemas.CompleteAcademicRecord(
         student=schemas.StudentProfile(
             name=user_doc.get('name') or exam_records[0].get('student_name', 'Student'),
@@ -393,16 +401,38 @@ async def get_dashboard_summary(current_user=Depends(get_current_user)):
     """
     Returns GPA, current enrollment status, and degree progress percentages.
     """
-    academic_record = await fetch_latest_academic_record(current_user.get("user_id"))
-    return {
-        "gpa": academic_record.academic_summary.cgpa,
-        "enrollment_status": "Enrolled",
-        "progress": {
-            "completed_credits": academic_record.academic_summary.total_credits_earned,
-            "required_credits": 132,  # From real data
-            "percentage": round((academic_record.academic_summary.total_credits_earned / 132) * 100, 1)
+    try:
+        academic_record = await fetch_latest_academic_record(current_user.get("user_id"))
+        
+        # Debug logging
+        print(f"Dashboard Summary - User ID: {current_user.get('user_id')}")
+        print(f"CGPA: {academic_record.academic_summary.cgpa}")
+        print(f"Total Credits Earned: {academic_record.academic_summary.total_credits_earned}")
+        print(f"Total Grade Points: {academic_record.academic_summary.total_grade_points}")
+        
+        return {
+            "gpa": academic_record.academic_summary.cgpa,
+            "enrollment_status": "Enrolled",
+            "progress": {
+                "completed_credits": academic_record.academic_summary.total_credits_earned,
+                "required_credits": 132,  # From real data
+                "percentage": round((academic_record.academic_summary.total_credits_earned / 132) * 100, 1)
+            }
         }
-    }
+    except Exception as e:
+        print(f"Error in dashboard summary: {e}")
+        import traceback
+        traceback.print_exc()
+        # Return default values if there's an error
+        return {
+            "gpa": 0.0,
+            "enrollment_status": "Enrolled",
+            "progress": {
+                "completed_credits": 0,
+                "required_credits": 132,
+                "percentage": 0.0
+            }
+        }
 
 @router.get("/activity", response_model=List[schemas.ActivityItem])
 async def get_recent_activity():
