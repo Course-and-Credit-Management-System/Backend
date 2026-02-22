@@ -1,4 +1,5 @@
 """Database configuration for MongoDB."""
+import asyncio
 from typing import Optional
 
 from beanie import init_beanie
@@ -26,15 +27,28 @@ async def init_db():
     """Initialize MongoDB connection and Beanie ODM."""
     global client
 
-    async def _connect(url: str) -> AsyncIOMotorClient:
-        mongo_client = AsyncIOMotorClient(
-            url,
-            serverSelectionTimeoutMS=5000,
-            connectTimeoutMS=10000,
-            socketTimeoutMS=20000,
-        )
-        await mongo_client.admin.command("ping")
-        return mongo_client
+    async def _connect(url: str, attempts: int = 3) -> AsyncIOMotorClient:
+        last_error: Optional[Exception] = None
+        for attempt in range(1, attempts + 1):
+            mongo_client = AsyncIOMotorClient(
+                url,
+                # Atlas/SRV discovery can be slow on some networks.
+                serverSelectionTimeoutMS=15000,
+                connectTimeoutMS=10000,
+                socketTimeoutMS=20000,
+            )
+            try:
+                await mongo_client.admin.command("ping")
+                return mongo_client
+            except (ConfigurationError, PyMongoError) as exc:
+                last_error = exc
+                mongo_client.close()
+                if attempt < attempts:
+                    await asyncio.sleep(attempt)
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("MongoDB connection failed for an unknown reason.")
 
     client = None
     primary_error: Optional[Exception] = None
@@ -52,12 +66,14 @@ async def init_db():
             except (ConfigurationError, PyMongoError) as fallback_exc:
                 raise RuntimeError(
                     "MongoDB connection failed for both primary MONGODB_URL and "
-                    "MONGODB_FALLBACK_URL."
+                    f"MONGODB_FALLBACK_URL. primary_error={primary_error!r}; "
+                    f"fallback_error={fallback_exc!r}"
                 ) from fallback_exc
         else:
             raise RuntimeError(
                 "MongoDB connection failed. If you are using mongodb+srv and your network "
-                "blocks DNS SRV lookups, set MONGODB_FALLBACK_URL to a reachable mongodb:// URI."
+                "blocks DNS SRV lookups, set MONGODB_FALLBACK_URL to a reachable mongodb:// URI. "
+                f"primary_error={exc!r}"
             ) from exc
 
     if client is None:
