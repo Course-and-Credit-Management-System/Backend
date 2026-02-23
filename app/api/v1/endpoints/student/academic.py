@@ -10,7 +10,7 @@ from bson import ObjectId
 from app.services.pdf_service import generate_certificate_pdf, generate_complete_transcript_pdf
 from app.services.grade_service import (
     calculate_course_points, calculate_gpa, calculate_academic_summary, 
-    get_result_tag, apply_retake_grade_logic
+    get_result_tag, apply_retake_grade_logic, get_grade_point
 )
 from app.api.v1.deps.auth import get_current_user
 from app.services.enrollment_settings_service import get_effective_enrollment_settings_for_user
@@ -38,6 +38,53 @@ def format_period_display(academic_year: str, semester: str) -> str:
         return "Fourth Year, Second Semester"
     # Fallback to original format if no pattern matches
     return f"{academic_year} ({semester})"
+
+def parse_semester_attend_v2(sem_str: str) -> tuple[str, str]:
+    """Parse semesterAttend string (e.g. '1st Year. First Sem' or '2nd Year, 2nd Sem') into (academic_year, semester)"""
+    if not sem_str:
+        return "Unknown Year", "Unknown Semester"
+        
+    # Split by common delimiters
+    if "." in sem_str:
+        parts = [p.strip() for p in sem_str.split(".")]
+    elif "," in sem_str:
+        parts = [p.strip() for p in sem_str.split(",")]
+    else:
+        # Fallback: try to split by " Year " if it exists
+        if " Year " in sem_str:
+            parts = [p.strip() for p in sem_str.split(" Year ")]
+            parts[0] = parts[0] + " Year"
+        else:
+            return sem_str, ""
+        
+    year_part = parts[0]
+    sem_part = parts[1] if len(parts) > 1 else ""
+    
+    # Generic map for ordinal numbers
+    ordinal_map = {
+        "1st": "First", 
+        "2nd": "Second", 
+        "3rd": "Third", 
+        "4th": "Fourth", 
+        "5th": "Fifth"
+    }
+    
+    # Apply mapping to year_part
+    for k, v in ordinal_map.items():
+        if year_part.startswith(k):
+            year_part = year_part.replace(k, v)
+            break
+            
+    # Apply mapping and formatting to sem_part
+    for k, v in ordinal_map.items():
+        if sem_part.startswith(k):
+            sem_part = sem_part.replace(k, v)
+            break
+            
+    if "Sem" in sem_part and "Semester" not in sem_part:
+        sem_part = sem_part.replace("Sem", "Semester")
+        
+    return year_part, sem_part
 
 async def _get_col(db, names: list[str]):
     cols = await db.list_collection_names()
@@ -130,9 +177,9 @@ async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas
     # Get user info
     user_doc = None
     if user_id:
-        user_doc = await users.find_one({"user_id": user_id})
+        user_doc = await users_col.find_one({"user_id": user_id})
         if not user_doc and ObjectId.is_valid(user_id):
-            user_doc = await users.find_one({"_id": ObjectId(user_id)})
+            user_doc = await users_col.find_one({"_id": ObjectId(user_id)})
 
     if not user_doc:
         return get_mock_academic_record()
@@ -144,17 +191,11 @@ async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas
     if not enrollment_records:
         return get_mock_academic_record()
     
-    # Create a lookup map for course information
+    # Fetch courses for titles and credits
     course_lookup = {}
-    async for course in courses.find({}):
-        course_code = course.get("course_code") or course.get("_id")
-        if course_code:
-            course_lookup[course_code] = {
-                "title": course.get("title", ""),
-                "credits": course.get("credits", 3),
-                "type": course.get("type", ""),
-                "department": course.get("department", "")
-            }
+    async for c in courses_col.find({}):
+        code = c.get("course_code") or str(c.get("_id"))
+        course_lookup[code] = c
     
     # Group results by year and semester
     semester_groups = {}
@@ -196,18 +237,15 @@ async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas
             semester_groups[group_key] = []
         semester_groups[group_key].append(result)
     
-    # Convert to semester structure with GPA calculations
     semesters_out = []
-    total_credits_passed = 0  # For display purposes (only passed credits)
-    total_credits_all = 0     # Total credits from all courses (passed + failed)
-    total_points = 0.0
+    total_credits_earned_all = 0
+    total_points_earned_all = 0.0
     
     for key, results in semester_groups.items():
         # Process results with credit limit
         processed_results = []
-        semester_credits_passed = 0  # Credits from passed courses only
-        semester_credits_total = 0   # Credits from all courses (passed + failed)
-        semester_points = 0.0
+        sem_credits_earned = 0.0 # Total Credits Earned in a Semester (Denominator)
+        sem_points_earned = 0.0  # Total Grade Points Earned (Numerator)
         
         for r in results:
             course_code = r.get('course_id', '')
@@ -228,44 +266,45 @@ async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas
                 final_grade = 'C'  # Static C grade for passed retakes
                 final_status = 'Passed'
             
-            # Create processed result with updated grade and status
-            processed_result = r.copy()
-            processed_result['final_grade'] = final_grade
-            processed_result['final_status'] = final_status
+            # Use grade_service to get standard Grade Points
+            gp = get_grade_point(grade)
+            if gp == 0.0 and grade != "F":
+                gp = float(r.get("points") or 0.0)
             
             # Use static 3 credits for all courses, not the points field
             course_credits = 3
             semester_credits_total += course_credits
             
-            # Only passed courses contribute grade points and count for passed credits
-            if final_status not in ['Failed', 'Retake'] and final_grade != 'F':
-                if semester_credits_passed < 24:  # Enforce 24 credit limit for passed courses
-                    semester_credits_passed += course_credits
-                    grade_points = calculate_course_points(final_grade, course_credits)
-                    semester_points += grade_points
-                    processed_result['counted_credits'] = course_credits
-                    processed_result['grade_points'] = grade_points
+            # According to user: Grade Points Earned = Grade Points x Credits Earned
+            if status in ["Passed", "Completed"] and grade != "F":
+                if sem_credits_earned + course_credits <= 24: # Enforce 24 credit limit
+                    sem_credits_earned += course_credits
+                    gpe = gp * course_credits
+                    sem_points_earned += gpe
                 else:
-                    # Mark as not counted if credit limit exceeded
-                    processed_result['counted_credits'] = 0
-                    processed_result['grade_points'] = 0
+                    gpe = 0.0
             else:
-                # Failed courses: 0 grade points but still count in total credits
-                processed_result['counted_credits'] = 0
-                processed_result['grade_points'] = 0
+                gpe = 0.0
+                
+            processed_results.append(
+                schemas.StudentResult(
+                    course_code=course_code,
+                    course_title=course_title,
+                    grade=grade,
+                    points=gp,
+                    status=status,
+                    result_tag=get_result_tag(grade),
+                    review_status=r.get("review_status", "None"),
+                    lecture_hours=2,
+                    tda_hours=2,
+                    credit_unit=int(course_credits),
+                    grade_points_earned=gpe
+                )
+            )
             
-            processed_results.append(processed_result)
-        
-        # Calculate semester GPA: grade points from passed courses / total credits from all courses
-        semester_gpa = calculate_gpa(semester_points, semester_credits_total)
-        
-        total_credits_passed += semester_credits_passed  # For display purposes (only passed credits)
-        total_credits_all += semester_credits_total   # Total credits from all courses
-        total_points += semester_points
-        
-        # Extract academic year and semester plain
-        academic_year = key.split(', ')[0]
-        semester_plain = key.split(', ')[1]
+        # GPA = Total Grade Points Earned / Total Credits Earned in a Semester
+        sem_gpa = calculate_gpa(sem_points_earned, sem_credits_earned)
+        academic_year, semester_plain = parse_semester_attend_v2(sem_key)
         
         semesters_out.append(
             schemas.SemesterResult(
@@ -314,11 +353,11 @@ async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas
             dob=user_doc.get('dob') or ''
         ),
         academic_summary=schemas.AcademicSummary(
-            total_credits_earned=total_credits_passed,  # Display only passed credits
-            total_grade_points=total_points,
+            total_credits_earned=int(total_credits_earned_all),
+            total_grade_points=total_points_earned_all,
             cgpa=cgpa,
-            semesters=semesters_out,
-        ),
+            semesters=semesters_out
+        )
     )
 
 # Mock Data for Multiple Semesters
@@ -491,6 +530,7 @@ async def get_degree_audit(current_user=Depends(get_current_user)):
     earn_core = 0.0
     earn_major_elec = 0.0
     earn_gen_ed = 0.0
+    passed_codes = set()
 
     passed_statuses = {"Passed", "Completed"}
     enroll_query = {
@@ -509,6 +549,9 @@ async def get_degree_audit(current_user=Depends(get_current_user)):
         major_specific = bool((course or {}).get("major_specific") or False)
         dept = (course or {}).get("department")
         code = (course or {}).get("course_code") or course_id_or_code
+        
+        if code:
+            passed_codes.add(str(code).strip())
 
         # Categorize
         is_core = (code in requirement_codes) or (ctype.lower() == "core")
@@ -961,7 +1004,7 @@ async def get_degree_progress(current_user=Depends(get_current_user)):
     
     # Get collections
     courses_col = await _get_col(db, ["Courses", "courses"])
-    enrollment_col = await _get_col(db, ["Enrollment", "enrollment"])
+    enrollment_col = await _get_col(db, ["Enrollments", "enrollments"])
     
     # Get all courses and categorize them
     all_courses = []
