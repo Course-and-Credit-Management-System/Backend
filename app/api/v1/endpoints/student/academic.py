@@ -19,22 +19,22 @@ router = APIRouter()
 
 def format_period_display(academic_year: str, semester: str) -> str:
     """Format period display name for PDF certificates"""
-    # Convert "1st Year, First Sem(new)" to "First Year, First Semester"
-    if "1st Year" in academic_year and "First Sem" in semester:
+    # Convert "First Year, First Semester" to proper display format
+    if "First Year" in academic_year and "First Semester" in semester:
         return "First Year, First Semester"
-    elif "1st Year" in academic_year and "Second Sem" in semester:
+    elif "First Year" in academic_year and "Second Semester" in semester:
         return "First Year, Second Semester"
-    elif "2nd Year" in academic_year and "First Sem" in semester:
+    elif "Second Year" in academic_year and "First Semester" in semester:
         return "Second Year, First Semester"
-    elif "2nd Year" in academic_year and "Second Sem" in semester:
+    elif "Second Year" in academic_year and "Second Semester" in semester:
         return "Second Year, Second Semester"
-    elif "3rd Year" in academic_year and "First Sem" in semester:
+    elif "Third Year" in academic_year and "First Semester" in semester:
         return "Third Year, First Semester"
-    elif "3rd Year" in academic_year and "Second Sem" in semester:
+    elif "Third Year" in academic_year and "Second Semester" in semester:
         return "Third Year, Second Semester"
-    elif "4th Year" in academic_year and "First Sem" in semester:
+    elif "Fourth Year" in academic_year and "First Semester" in semester:
         return "Fourth Year, First Semester"
-    elif "4th Year" in academic_year and "Second Sem" in semester:
+    elif "Fourth Year" in academic_year and "Second Semester" in semester:
         return "Fourth Year, Second Semester"
     # Fallback to original format if no pattern matches
     return f"{academic_year} ({semester})"
@@ -123,7 +123,6 @@ def _map_student_record(data: dict) -> schemas.CompleteAcademicRecord:
 
 async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas.CompleteAcademicRecord:
     db = await get_database()
-    exam_results = await _get_col(db, ["ExamResults", "exam_results"])
     enrollments = await _get_col(db, ["Enrollments", "enrollments"])
     courses = await _get_col(db, ["Courses", "courses"])
     users = await _get_col(db, ["Users", "users"])
@@ -138,24 +137,12 @@ async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas
     if not user_doc:
         return get_mock_academic_record()
     
-    # Get exam results for this student
-    exam_query = {"student_id": user_id} if user_id else {}
-    exam_records = await exam_results.find(exam_query).to_list(None)
-    
-    # Get enrollment data for retake information
-    enrollment_query = {"student_id": user_id, "is_retake": True} if user_id else {"is_retake": True}
+    # Get enrollment records for this student
+    enrollment_query = {"student_id": user_id} if user_id else {}
     enrollment_records = await enrollments.find(enrollment_query).to_list(None)
     
-    # Create a lookup map for retake information
-    retake_lookup = {}
-    for enrollment in enrollment_records:
-        course_id = enrollment.get("course_id") or enrollment.get("course_code")
-        if course_id:
-            retake_lookup[course_id] = {
-                "is_retake": enrollment.get("is_retake", False),
-                "status": enrollment.get("status", ""),
-                "semester": enrollment.get("semesterAttend", "")
-            }
+    if not enrollment_records:
+        return get_mock_academic_record()
     
     # Create a lookup map for course information
     course_lookup = {}
@@ -169,22 +156,40 @@ async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas
                 "department": course.get("department", "")
             }
     
-    if not exam_records:
-        return get_mock_academic_record()
-    
     # Group results by year and semester
     semester_groups = {}
-    for result in exam_records:
-        year_num = result['year']
-        # Convert year number to proper format
-        year_map = {
-            1: "First Year",
-            2: "Second Year", 
-            3: "Third Year",
-            4: "Fourth Year"
-        }
-        year_key = year_map.get(year_num, f"{year_num}th Year")
-        semester_key = "First Semester" if result['semester'] == 1 else "Second Semester"
+    for result in enrollment_records:
+        # Parse semesterAttend field (e.g., "1st Year. First Sem")
+        semester_attend = result.get('semesterAttend', '')
+        
+        # Use the exact format from Enrollments collection
+        # semester_attend format: "1st Year. First Sem", "2nd Year. Second Sem", etc.
+        
+        # Extract year part (before the dot)
+        year_part = semester_attend.split('.')[0] if '.' in semester_attend else semester_attend
+        # Extract semester part (after the dot)
+        semester_part = semester_attend.split('.')[1] if '.' in semester_attend else ''
+        
+        # Convert year part to display format (1st Year -> First Year, etc.)
+        if '1st Year' in year_part:
+            year_key = "First Year"
+        elif '2nd Year' in year_part:
+            year_key = "Second Year"
+        elif '3rd Year' in year_part:
+            year_key = "Third Year"
+        elif '4th Year' in year_part:
+            year_key = "Fourth Year"
+        else:
+            year_key = year_part  # Keep as is if not recognized
+        
+        # Convert semester part to display format (First Sem -> First Semester, etc.)
+        if 'First Sem' in semester_part:
+            semester_key = "First Semester"
+        elif 'Second Sem' in semester_part:
+            semester_key = "Second Semester"
+        else:
+            semester_key = semester_part  # Keep as is if not recognized
+        
         group_key = f"{year_key}, {semester_key}"
         
         if group_key not in semester_groups:
@@ -198,24 +203,28 @@ async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas
     total_points = 0.0
     
     for key, results in semester_groups.items():
-        # Process results with retake information and credit limit
+        # Process results with credit limit
         processed_results = []
         semester_credits_passed = 0  # Credits from passed courses only
         semester_credits_total = 0   # Credits from all courses (passed + failed)
         semester_points = 0.0
         
         for r in results:
-            course_code = r.get('course_code', '')
-            # Check if this course is a retake from enrollment data
-            retake_info = retake_lookup.get(course_code, {})
-            is_retake = retake_info.get('is_retake', False)
-            enrollment_status = retake_info.get('status', '')
+            course_code = r.get('course_id', '')
+            # Use the is_retake field from enrollment data (handle both boolean and string)
+            is_retake_raw = r.get('is_retake', False)
+            # Convert string "true"/"false" to boolean if needed
+            if isinstance(is_retake_raw, str):
+                is_retake = is_retake_raw.lower() == 'true'
+            else:
+                is_retake = is_retake_raw
             
-            # Apply retake logic: if enrollment shows passed status, use static C grade
+            # Use the grade and status from enrollment data
             final_grade = r.get('grade', '')
             final_status = r.get('status', '')
             
-            if is_retake and enrollment_status in ['Passed', 'Completed']:
+            # Apply retake logic: if retake and passed, use static C grade
+            if is_retake and final_status in ['Passed', 'Completed']:
                 final_grade = 'C'  # Static C grade for passed retakes
                 final_status = 'Passed'
             
@@ -224,7 +233,7 @@ async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas
             processed_result['final_grade'] = final_grade
             processed_result['final_status'] = final_status
             
-            # Count all courses for total credits (passed + failed)
+            # Use static 3 credits for all courses, not the points field
             course_credits = 3
             semester_credits_total += course_credits
             
@@ -264,16 +273,16 @@ async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas
                 semester=semester_plain,
                 results=[
                     schemas.StudentResult(
-                        course_code=r.get('course_code', ''),
-                        course_title=course_lookup.get(r.get('course_code', ''), {}).get('title', r.get('course_code', '')),  # Use real course title
+                        course_code=r.get('course_id', ''),
+                        course_title=course_lookup.get(r.get('course_id', ''), {}).get('title', r.get('course_id', '')),  # Use real course title
                         grade=r.get('final_grade', ''),
-                        points=float(r.get('grade_point', 0)),
+                        points=float(r.get('points', 0)),
                         status=r.get('final_status', 'Unknown'),
                         result_tag=get_result_tag(r.get('final_grade', '')),
                         review_status=r.get('review_status', 'None'),
                         lecture_hours=2,
                         tda_hours=2,
-                        credit_unit=3,  # All courses have 3 credits for GPA calculation
+                        credit_unit=3,  # Static 3 credits for all courses
                         grade_points_earned=r.get('grade_points', 0.0)
                     )
                     for r in processed_results
@@ -288,17 +297,18 @@ async def fetch_latest_academic_record(user_id: Optional[str] = None) -> schemas
     # Grade points only from passed courses, but credits from all courses (passed + failed)
     cgpa = calculate_gpa(total_points, total_credits_all)
     
-    # Debug logging for final calculation
-    print(f"Final CGPA Calculation:")
-    print(f"  Total Grade Points: {total_points}")
-    print(f"  Total Credits (All): {total_credits_all}")
-    print(f"  CGPA: {cgpa}")
-    print(f"  Total Credits (Passed): {total_credits_passed}")
-    print(f"  Number of Semesters: {len(semesters_out)}")
+    # Sort semesters chronologically for PDF generation
+    year_order = {"First Year": 1, "Second Year": 2, "Third Year": 3, "Fourth Year": 4}
+    semester_order = {"First Semester": 1, "Second Semester": 2}
+    
+    semesters_out.sort(key=lambda sem: (
+        year_order.get(sem.academic_year, 99),
+        semester_order.get(sem.semester, 99)
+    ))
     
     return schemas.CompleteAcademicRecord(
         student=schemas.StudentProfile(
-            name=user_doc.get('name') or exam_records[0].get('student_name', 'Student'),
+            name=user_doc.get('name') or enrollment_records[0].get('student_name', 'Student'),
             nrc=user_doc.get('nrc') or '',
             sex=user_doc.get('sex') or '',
             dob=user_doc.get('dob') or ''
@@ -404,12 +414,6 @@ async def get_dashboard_summary(current_user=Depends(get_current_user)):
     try:
         academic_record = await fetch_latest_academic_record(current_user.get("user_id"))
         
-        # Debug logging
-        print(f"Dashboard Summary - User ID: {current_user.get('user_id')}")
-        print(f"CGPA: {academic_record.academic_summary.cgpa}")
-        print(f"Total Credits Earned: {academic_record.academic_summary.total_credits_earned}")
-        print(f"Total Grade Points: {academic_record.academic_summary.total_grade_points}")
-        
         return {
             "gpa": academic_record.academic_summary.cgpa,
             "enrollment_status": "Enrolled",
@@ -461,7 +465,6 @@ async def get_degree_audit(current_user=Depends(get_current_user)):
     db = await get_database()
     users = await _get_col(db, ["Users", "users"])
     enrollments = await _get_col(db, ["Enrollments", "enrollments"])
-    exam_results = await _get_col(db, ["ExamResults", "exam_results"])
     courses = await _get_col(db, ["Courses", "courses"])
     majors = await _get_col(db, ["majors", "Majors"])
 
@@ -567,7 +570,7 @@ async def get_degree_audit(current_user=Depends(get_current_user)):
     # ---------------------------
     # Additional course-count progress bars (Core, Elective, Major, Overall)
     # Data source:
-    #  - Passed courses from ExamResults (status not Failed/Retake and grade != 'F')
+    #  - Passed courses from Enrollments (status not Failed/Retake and grade != 'F')
     #  - Total courses from Courses by type
     # ---------------------------
     # Total courses by type
@@ -576,13 +579,13 @@ async def get_degree_audit(current_user=Depends(get_current_user)):
     total_major_courses = await courses.count_documents({"type": {"$in": ["Major", "major"]}})
 
     # Passed unique course codes for the current student
-    exam_query = {"student_id": user_id} if user_id else {}
-    exam_recs = await exam_results.find(exam_query).to_list(None)
+    enrollment_query = {"student_id": user_id} if user_id else {}
+    enrollment_recs = await enrollments.find(enrollment_query).to_list(None)
     def _is_passed(rec: dict) -> bool:
         st = (rec.get("status") or "").strip()
         gr = (rec.get("grade") or "").strip()
         return (st not in ["Failed", "Retake"]) and (gr.upper() != "F")
-    passed_codes = {str(r.get("course_code") or "").strip() for r in exam_recs if _is_passed(r) and r.get("course_code")}
+    passed_codes = {str(r.get("course_id") or "").strip() for r in enrollment_recs if _is_passed(r) and r.get("course_id")}
     passed_codes = {c for c in passed_codes if c}
 
     passed_core_courses = 0
@@ -766,10 +769,10 @@ async def download_certificate_pdf(
         year_semesters = []
         for sem in academic_record.academic_summary.semesters:
             sem_academic_year = sem.academic_year
-            if (academic_year == "First Year" and ("1st Year" in sem_academic_year or "First Year" in sem_academic_year)) or \
-               (academic_year == "Second Year" and ("2nd Year" in sem_academic_year or "Second Year" in sem_academic_year)) or \
-               (academic_year == "Third Year" and ("3rd Year" in sem_academic_year or "Third Year" in sem_academic_year)) or \
-               (academic_year == "Fourth Year" and ("4th Year" in sem_academic_year or "Fourth Year" in sem_academic_year)):
+            if (academic_year == "First Year" and ("First Year" in sem_academic_year)) or \
+               (academic_year == "Second Year" and ("Second Year" in sem_academic_year)) or \
+               (academic_year == "Third Year" and ("Third Year" in sem_academic_year)) or \
+               (academic_year == "Fourth Year" and ("Fourth Year" in sem_academic_year)):
                 year_semesters.append(sem)
         
         # Fallback to exact match if no year-level matches found
