@@ -10,15 +10,15 @@ def score_to_grade(score: float):
     if score >= 80:
         return "A", 4.0, "Passed"
     if score >= 75:
-        return "A-", 3.7, "Passed"
+        return "A-", 3.67, "Passed"
     if score >= 70:
-        return "B+", 3.3, "Passed"
+        return "B+", 3.33, "Passed"
     if score >= 65:
         return "B", 3.0, "Passed"
     if score >= 60:
-        return "B-", 2.7, "Passed"
+        return "B-", 2.67, "Passed"
     if score >= 55:
-        return "C+", 2.3, "Probation"
+        return "C+", 2.33, "Probation"
     if score >= 50:
         return "C", 2.0, "Probation"
     if score >= 40:
