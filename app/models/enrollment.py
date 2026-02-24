@@ -1,7 +1,8 @@
 from typing import Optional
 from beanie import Document, PydanticObjectId
-from pydantic import Field
+from pydantic import Field, model_validator
 from enum import Enum
+from app.services.enrollment_academic_year_service import compute_enrollment_academic_year
 
 class EnrollmentStatus(str, Enum):
     ENROLLED = "Enrolled"
@@ -35,6 +36,7 @@ class Enrollment(Document):
     student_id: str = Field(..., description="Ref to User.user_id")
     course_id: str = Field(..., description="Ref to Course.course_code")
     semester_attend: str = Field(..., alias="semesterAttend", description="e.g., 'First Year, First Sem(old)'")
+    academic_year: Optional[str] = Field(default=None, description="Computed label like '2024-2025'")
     is_retake: bool = False
     status: EnrollmentStatus
     
@@ -52,6 +54,12 @@ class Enrollment(Document):
     points: Optional[float] = Field(default=None)
     scores: Optional[float] = Field(default=None)
     reason: Optional[str] = Field(default=None, description="Reason for status change (e.g. admin note)")
+
+    @model_validator(mode="after")
+    def ensure_academic_year(self):
+        if not self.academic_year:
+            self.academic_year = compute_enrollment_academic_year(self.semester_attend)
+        return self
 
     class Settings:
         name = "Enrollments"
