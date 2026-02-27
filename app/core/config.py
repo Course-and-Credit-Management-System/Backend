@@ -1,8 +1,12 @@
 """Application configuration module."""
 from functools import lru_cache
+from pathlib import Path
 from typing import List
 
 from pydantic_settings import BaseSettings
+
+
+BASE_DIR = Path(__file__).resolve().parents[2]
 
 
 class Settings(BaseSettings):
@@ -77,7 +81,8 @@ class Settings(BaseSettings):
     KNOWLEDGE_VECTOR_INDEX_NAME: str = "knowledge_vector_index"
 
     class Config:
-        env_file = ".env"
+        # Load env vars from Backend/.env no matter the current working directory.
+        env_file = BASE_DIR / ".env"
         case_sensitive = True
 
 

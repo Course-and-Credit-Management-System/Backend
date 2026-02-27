@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from app.core.database import get_db
 from app.schemas.exam_result import ExamResultUpsertIn, ExamResultOut
 from app.services.grading_service import score_to_grade
+from app.services.enrollment_academic_year_service import compute_enrollment_academic_year
 from io import BytesIO
 import openpyxl
 
@@ -128,6 +129,7 @@ async def import_exam_results_excel(
                 "student_id": student_id,
                 "course_id": course_id,
                 "semesterAttend": semester_attend,
+                "academic_year": compute_enrollment_academic_year(semester_attend),
                 "scores": scores,
                 "grade": grade,
                 "points": points,
@@ -310,6 +312,7 @@ async def upsert_exam_result(payload: ExamResultUpsertIn, db=Depends(get_db)):
             "student_id": payload.student_id,
             "course_id": payload.course_code,  # Map course_code to course_id
             "semesterAttend": semester_attend,
+            "academic_year": compute_enrollment_academic_year(semester_attend),
             "status": status,
             "grade": grade,
             "points": grade_point,  # Map grade_point to points
