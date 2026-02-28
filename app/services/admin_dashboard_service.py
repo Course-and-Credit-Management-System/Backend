@@ -352,8 +352,54 @@ class AdminDashboardService:
                     "credits": int(credits) if isinstance(credits, (int, float)) else 0,
                     "grade": (e.get("grade").value if hasattr(e.get("grade"), "value") else e.get("grade")) or "-",
                     "status": (e.get("status").value if hasattr(e.get("status"), "value") else e.get("status")) or "Enrolled",
+                    "semester": e.get("semesterAttend") or e.get("semester_attend") or "",
                 }
             )
+
+        # Build academic_history from actual enrollment data
+        academic_history_enhanced = []
+        
+        # Get all enrollments for this student
+        student_enrollments = await self.enrollments.find({
+            "$or": [
+                {"student_id": student_id},
+                {"student_user_id": student_id},
+                {"user_id": student_id},
+            ]
+        }).to_list(length=200)
+        
+        # Group enrollments by semester
+        semester_groups = {}
+        for enrollment in student_enrollments:
+            semester_attend = enrollment.get("semesterAttend") or enrollment.get("semester_attend", "Unknown")
+            course_code = enrollment.get("course_id") or enrollment.get("course_code", "Unknown")
+            
+            if semester_attend not in semester_groups:
+                semester_groups[semester_attend] = []
+            semester_groups[semester_attend].append(course_code)
+        
+        # Map to academic_history format and try to match with stored GPA data
+        semester_mapping = {
+            '1st Year. First Sem': 'New . First Year . First Sem',
+            '1st Year. Second Sem': 'New . First Year . Second Sem', 
+            '2nd Year. First Sem': 'New . Second Year . First Sem',
+            '2nd Year. Second Sem': 'New . Second Year . Second Sem'
+        }
+        
+        # Get stored academic_history for GPA data
+        stored_academic_history = sp.get("academic_history", [])
+        gpa_mapping = {}
+        for stored_entry in stored_academic_history:
+            gpa_mapping[stored_entry.get("semester")] = stored_entry.get("GPA", 0)
+        
+        # Build enhanced academic_history
+        for actual_semester, courses in semester_groups.items():
+            mapped_semester = semester_mapping.get(actual_semester, actual_semester)
+            academic_history_enhanced.append({
+                "semester": mapped_semester,
+                "enrollments": courses,
+                "GPA": gpa_mapping.get(mapped_semester, 0)
+            })
 
         payload = {
             "id": student.get("user_id") or student.get("id") or student_id,
@@ -372,6 +418,7 @@ class AdminDashboardService:
             "status": sp.get("academic_status") or student.get("status") or "Active",
             "avatar": sp.get("avatar") or "",
             "enrollments": enrollment_rows,
+            "academic_history": academic_history_enhanced,
         }
 
         return payload
