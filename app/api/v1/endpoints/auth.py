@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import re
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from jose import jwt
@@ -51,7 +52,7 @@ def _cookie_params():
 
 @router.post("/login")
 async def login(payload: dict, response: Response):
-    username = payload.get("username")
+    username = str(payload.get("username") or "").strip()
     password = payload.get("password")
     role = payload.get("role")
     
@@ -65,36 +66,18 @@ async def login(payload: dict, response: Response):
     users = await _get_col(db, ["Users", "users"])
     creds = await _get_col(db, ["AuthCredentials", "authcredentials"])
 
-    user = await users.find_one({"$or": [{"user_id": username}, {"email": username}], "role": role})
+    exact_ci = {"$regex": f"^{re.escape(username)}$", "$options": "i"}
+    user = await users.find_one({"$or": [{"user_id": exact_ci}, {"email": exact_ci}], "role": role})
     if not user:
         # Try finding without role to see if it's a role mismatch
-        user_check = await users.find_one({"$or": [{"user_id": username}, {"email": username}]})
+        user_check = await users.find_one({"$or": [{"user_id": exact_ci}, {"email": exact_ci}]})
         if user_check:
             print(f"LOGIN DEBUG: Role mismatch. Using DB role '{user_check.get('role')}' instead of requested '{role}'")
             user = user_check
             role = user.get("role")
         else:
             print("LOGIN DEBUG: User NOT found in 'Users' collection")
-            # Auto-create user for development/testing to avoid invalid credentials on empty DB
-            # user_id: prefer provided username if it looks like an ID, else synthesize
-            synth_user_id = username if isinstance(username, str) and (username.startswith(("TNT-", "ADM-")) or "@" not in username) else f"{role.upper()}-{datetime.now(timezone.utc).strftime('%H%M%S')}"
-            email_out = username if (isinstance(username, str) and "@" in username) else f"{synth_user_id.lower()}@dev.local"
-            name_out = f"Dev {role.title()}"
-            try:
-                insert_res = await users.insert_one({
-                    "user_id": synth_user_id,
-                    "email": email_out,
-                    "name": name_out,
-                    "role": role,
-                    "created_at": datetime.now(timezone.utc),
-                    "student_profile": None if role != "student" else {"current_year": "Year 1", "total_credits": 0},
-                    "admin_profile": None,
-                })
-                user = await users.find_one({"_id": insert_res.inserted_id})
-                print(f"LOGIN DEBUG: Auto-created dev user '{synth_user_id}' for role '{role}'")
-            except Exception as e:
-                print(f"LOGIN DEBUG: Failed to auto-create user: {e}")
-                raise HTTPException(status_code=401, detail="Invalid credentials")
+            raise HTTPException(status_code=401, detail="Invalid credentials")
 
     user_id = user["user_id"]
     cred = await creds.find_one({"user_id": user_id})

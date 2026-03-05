@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from jose import jwt
 from datetime import datetime, timezone, timedelta
+import re
 
 from app.core.config import settings
 from app.core.database import init_db, close_db, get_database
@@ -75,20 +76,11 @@ async def simple_login(payload: SimpleLoginPayload, response: Response):
     db = await get_database()
     users = db["Users"]
     creds = db["AuthCredentials"]
-    email_or_id = str(payload.email).strip().lower()
-    user = await users.find_one({"$or": [{"email": email_or_id}, {"user_id": email_or_id}]})
+    email_or_id = str(payload.email).strip()
+    exact_ci = {"$regex": f"^{re.escape(email_or_id)}$", "$options": "i"}
+    user = await users.find_one({"$or": [{"email": exact_ci}, {"user_id": exact_ci}]})
     if not user:
-        try:
-            synth_id = email_or_id.split("@")[0] if "@" in email_or_id else email_or_id
-            await users.insert_one({
-                "user_id": synth_id,
-                "email": email_or_id if "@" in email_or_id else f"{synth_id}@dev.local",
-                "name": "Dev User",
-                "role": "student",
-            })
-            user = await users.find_one({"user_id": synth_id})
-        except Exception:
-            raise HTTPException(status_code=401, detail="Invalid credentials")
+        raise HTTPException(status_code=401, detail="Invalid credentials")
     cred = await creds.find_one({"user_id": user["user_id"]})
     if not cred:
         default_hash = hash_password(settings.DEFAULT_PASSWORD)

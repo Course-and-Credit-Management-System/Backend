@@ -331,75 +331,139 @@ class AdminDashboardService:
         except Exception:
             year_num, sem_num = 1, 1
 
+        def _grade_point(grade: str) -> float:
+            grade_norm = str(grade or "").strip().upper()
+            table = {
+                "A+": 4.0,
+                "A": 4.0,
+                "A-": 3.67,
+                "B+": 3.33,
+                "B": 3.0,
+                "B-": 2.67,
+                "C+": 2.33,
+                "C": 2.0,
+                "C-": 1.67,
+                "D+": 1.33,
+                "D": 1.0,
+                "F": 0.0,
+            }
+            return float(table.get(grade_norm, 0.0))
+
+        def _semester_sort_key(sem_label: str) -> tuple[int, int]:
+            text = str(sem_label or "").lower()
+            year = 99
+            sem = 99
+            if "1st year" in text or "first year" in text:
+                year = 1
+            elif "2nd year" in text or "second year" in text:
+                year = 2
+            elif "3rd year" in text or "third year" in text:
+                year = 3
+            elif "4th year" in text or "fourth year" in text:
+                year = 4
+            elif "5th year" in text or "fifth year" in text:
+                year = 5
+
+            if "first sem" in text or "semester 1" in text:
+                sem = 1
+            elif "second sem" in text or "semester 2" in text:
+                sem = 2
+            return (year, sem)
+
+        # Bulk-load course metadata once to avoid per-row DB calls.
+        course_tokens: set[str] = set()
+        for e in enrollments:
+            token = str(e.get("course_id") or e.get("course_code") or "").strip()
+            if token:
+                course_tokens.add(token)
+
+        course_cache: Dict[str, Dict[str, Any]] = {}
+        if course_tokens:
+            course_docs = await self.courses.find(
+                {"$or": [{"course_code": {"$in": list(course_tokens)}}, {"_id": {"$in": list(course_tokens)}}]}
+            ).to_list(length=500)
+            for c in course_docs:
+                code_key = str(c.get("course_code") or "").strip()
+                id_key = str(c.get("_id") or "").strip()
+                if code_key:
+                    course_cache[code_key] = c
+                if id_key:
+                    course_cache[id_key] = c
+
         enrollment_rows = []
+        semester_groups: Dict[str, List[Dict[str, Any]]] = {}
+        passed_statuses = {"passed", "completed"}
         for e in enrollments:
             if "_id" in e:
-                e["_id"] = str(e["_id"])
+                e["_id"] = str(e.get("_id"))
 
-            course_code = e.get("course_id") or e.get("course_code") or ""
-            course_doc = None
-            if course_code:
-                course_doc = await self.courses.find_one({"course_code": course_code})
+            course_token = str(e.get("course_id") or e.get("course_code") or "").strip()
+            course_doc = course_cache.get(course_token, {})
+            course_code = str(course_doc.get("course_code") or course_token or "-")
+            title = str(course_doc.get("title") or course_doc.get("name") or course_code or "-")
+            credits = float(course_doc.get("credits") or e.get("credits") or 3)
 
-            title = (course_doc or {}).get("title") or (course_doc or {}).get("name") or "-"
-            credits = (course_doc or {}).get("credits") or 0
+            grade = (e.get("grade").value if hasattr(e.get("grade"), "value") else e.get("grade")) or "-"
+            status = (e.get("status").value if hasattr(e.get("status"), "value") else e.get("status")) or "Enrolled"
+            semester_label = str(e.get("semesterAttend") or e.get("semester_attend") or "Unknown")
+
+            gp = _grade_point(grade)
+            passed = str(status).strip().lower() in passed_statuses and str(grade).strip().upper() != "F"
+            earned_credits = credits if passed else 0.0
+            gpe = gp * earned_credits if passed else 0.0
 
             enrollment_rows.append(
                 {
                     "id": str(e.get("_id") or ""),
-                    "code": course_code or "-",
+                    "code": course_code,
                     "name": title,
-                    "credits": int(credits) if isinstance(credits, (int, float)) else 0,
-                    "grade": (e.get("grade").value if hasattr(e.get("grade"), "value") else e.get("grade")) or "-",
-                    "status": (e.get("status").value if hasattr(e.get("status"), "value") else e.get("status")) or "Enrolled",
-                    "semester": e.get("semesterAttend") or e.get("semester_attend") or "",
+                    "credits": int(credits),
+                    "grade": grade,
+                    "status": status,
+                    "semester": semester_label,
+                    "grade_points": gp,
+                    "grade_points_earned": gpe,
                 }
             )
 
-        # Build academic_history from actual enrollment data
+            semester_groups.setdefault(semester_label, []).append(
+                {
+                    "course_code": course_code,
+                    "course_title": title,
+                    "grade": grade,
+                    "status": status,
+                    "credits": int(credits),
+                    "grade_points": gp,
+                    "grade_points_earned": gpe,
+                    "credits_earned": earned_credits,
+                }
+            )
+
         academic_history_enhanced = []
-        
-        # Get all enrollments for this student
-        student_enrollments = await self.enrollments.find({
-            "$or": [
-                {"student_id": student_id},
-                {"student_user_id": student_id},
-                {"user_id": student_id},
-            ]
-        }).to_list(length=200)
-        
-        # Group enrollments by semester
-        semester_groups = {}
-        for enrollment in student_enrollments:
-            semester_attend = enrollment.get("semesterAttend") or enrollment.get("semester_attend", "Unknown")
-            course_code = enrollment.get("course_id") or enrollment.get("course_code", "Unknown")
-            
-            if semester_attend not in semester_groups:
-                semester_groups[semester_attend] = []
-            semester_groups[semester_attend].append(course_code)
-        
-        # Map to academic_history format and try to match with stored GPA data
-        semester_mapping = {
-            '1st Year. First Sem': 'New . First Year . First Sem',
-            '1st Year. Second Sem': 'New . First Year . Second Sem', 
-            '2nd Year. First Sem': 'New . Second Year . First Sem',
-            '2nd Year. Second Sem': 'New . Second Year . Second Sem'
-        }
-        
-        # Get stored academic_history for GPA data
-        stored_academic_history = sp.get("academic_history", [])
-        gpa_mapping = {}
-        for stored_entry in stored_academic_history:
-            gpa_mapping[stored_entry.get("semester")] = stored_entry.get("GPA", 0)
-        
-        # Build enhanced academic_history
-        for actual_semester, courses in semester_groups.items():
-            mapped_semester = semester_mapping.get(actual_semester, actual_semester)
-            academic_history_enhanced.append({
-                "semester": mapped_semester,
-                "enrollments": courses,
-                "GPA": gpa_mapping.get(mapped_semester, 0)
-            })
+        cgpa_credits = 0.0
+        cgpa_points = 0.0
+        for sem_label, courses_in_sem in sorted(semester_groups.items(), key=lambda kv: _semester_sort_key(kv[0])):
+            sem_credits_earned = float(sum(float(c.get("credits_earned") or 0.0) for c in courses_in_sem))
+            sem_points_earned = float(sum(float(c.get("grade_points_earned") or 0.0) for c in courses_in_sem))
+            sem_gpa = round((sem_points_earned / sem_credits_earned), 2) if sem_credits_earned > 0 else 0.0
+
+            cgpa_credits += sem_credits_earned
+            cgpa_points += sem_points_earned
+
+            academic_history_enhanced.append(
+                {
+                    "semester": sem_label,
+                    "courses": courses_in_sem,
+                    # Keep legacy key for compatibility with older frontend consumers.
+                    "enrollments": [c["course_code"] for c in courses_in_sem],
+                    "total_credits_earned": int(sem_credits_earned),
+                    "total_grade_points": sem_points_earned,
+                    "gpa": sem_gpa,
+                    "GPA": sem_gpa,
+                }
+            )
+
+        calculated_cgpa = round((cgpa_points / cgpa_credits), 2) if cgpa_credits > 0 else 0.0
 
         payload = {
             "id": student.get("user_id") or student.get("id") or student_id,
@@ -411,7 +475,8 @@ class AdminDashboardService:
             "year": year_num,
             "semester": sem_num,
             "section": sp.get("section"),
-            "gpa": float(sp.get("gpa") or sp.get("cgpa") or 0.0),
+            "gpa": float(sp.get("gpa") or calculated_cgpa or sp.get("cgpa") or 0.0),
+            "cgpa": float(sp.get("cgpa") or calculated_cgpa or sp.get("gpa") or 0.0),
             "advisor": sp.get("advisor") or sp.get("advisor_name") or "—",
             "creditsEarned": total_credits,
             "creditsRequired": required_credits,
