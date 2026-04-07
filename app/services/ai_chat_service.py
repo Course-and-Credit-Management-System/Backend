@@ -48,6 +48,30 @@ _EMBED_CACHE_LOCK = asyncio.Lock()
 _CHAT_CACHE_LOCK = asyncio.Lock()
 
 
+def _create_inflight_future() -> asyncio.Future:
+    """
+    Create an inflight future and eagerly drain exceptions.
+
+    When the owner task fails before any peer awaits the future, asyncio can log
+    "Future exception was never retrieved". Reading the exception in a done
+    callback keeps the logs clean while preserving the awaited error behavior.
+    """
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+
+    def _drain_future_exception(done_future: asyncio.Future) -> None:
+        if done_future.cancelled():
+            return
+        try:
+            done_future.exception()
+        except Exception:
+            # Accessing the exception is only for suppressing noisy asyncio logs.
+            pass
+
+    future.add_done_callback(_drain_future_exception)
+    return future
+
+
 async def _throttle_gemini_request_rate() -> None:
     """Process-local throttle to reduce bursty provider 429s."""
     global _LAST_GEMINI_REQUEST_TS
@@ -184,8 +208,7 @@ async def embed_texts(
                 return [cached[1]]
             inflight_future = _EMBED_INFLIGHT.get(embed_cache_key)
             if inflight_future is None:
-                loop = asyncio.get_running_loop()
-                inflight_future = loop.create_future()
+                inflight_future = _create_inflight_future()
                 _EMBED_INFLIGHT[embed_cache_key] = inflight_future
                 is_embed_owner = True
 
@@ -705,8 +728,7 @@ async def call_gemini_chat(
             return cached[1]
         inflight = _CHAT_INFLIGHT.get(chat_cache_key)
         if inflight is None:
-            loop = asyncio.get_running_loop()
-            inflight = loop.create_future()
+            inflight = _create_inflight_future()
             _CHAT_INFLIGHT[chat_cache_key] = inflight
             is_owner = True
         else:
