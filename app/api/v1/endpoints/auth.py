@@ -111,22 +111,7 @@ async def login(payload: dict, response: Response):
 
     if not verify_password(password, cred["password_hash"]):
         print(f"LOGIN DEBUG: Password verification failed for user {username}")
-        default_match = str(password) == str(settings.DEFAULT_PASSWORD) or str(password).lower() == str(settings.DEFAULT_PASSWORD).lower()
-        if default_match or bool(cred.get("must_reset_password", False)):
-            print("LOGIN DEBUG: Dev fallback: resetting password hash to DEFAULT_PASSWORD")
-            new_hash = hash_password(settings.DEFAULT_PASSWORD)
-            await creds.update_one(
-                {"user_id": user_id},
-                {
-                    "$set": {
-                        "password_hash": new_hash,
-                        "must_reset_password": True,
-                        "updated_at": datetime.now(timezone.utc),
-                    }
-                },
-            )
-        else:
-            raise HTTPException(status_code=401, detail="Invalid credentials")
+        raise HTTPException(status_code=401, detail="Invalid credentials")
 
     expire = datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     token_payload = {"sub": user_id, "role": user["role"], "exp": expire}

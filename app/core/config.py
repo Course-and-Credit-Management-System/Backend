@@ -62,6 +62,7 @@ class Settings(BaseSettings):
     FRONTEND_URL: str
 
     # --- AI / Gemini RAG ---
+    AI_CHAT_PROVIDER: str = "gemini"
     GEMINI_API_KEY: str | None = None  # Optional; app works without AI features
     GEMINI_API_BASE: str = "https://generativelanguage.googleapis.com/v1beta"
     GEMINI_CHAT_MODEL: str = "gemini-2.5-pro"
@@ -79,6 +80,12 @@ class Settings(BaseSettings):
     AI_RAG_SCORE_THRESHOLD: float | None = None
     KNOWLEDGE_BASE_COLLECTION: str = "KnowledgeBase"
     KNOWLEDGE_VECTOR_INDEX_NAME: str = "knowledge_vector_index"
+
+    # --- AI / Ollama chat ---
+    OLLAMA_API_BASE: str = "http://localhost:11434"
+    OLLAMA_API_KEY: str | None = None
+    OLLAMA_CHAT_MODEL: str = "glm-5:cloud"
+    OLLAMA_CHAT_TIMEOUT_SECONDS: float = 60.0
 
     class Config:
         # Load env vars from Backend/.env no matter the current working directory.

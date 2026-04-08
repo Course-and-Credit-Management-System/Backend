@@ -48,6 +48,30 @@ _EMBED_CACHE_LOCK = asyncio.Lock()
 _CHAT_CACHE_LOCK = asyncio.Lock()
 
 
+def _create_inflight_future() -> asyncio.Future:
+    """
+    Create an inflight future and eagerly drain exceptions.
+
+    When the owner task fails before any peer awaits the future, asyncio can log
+    "Future exception was never retrieved". Reading the exception in a done
+    callback keeps the logs clean while preserving the awaited error behavior.
+    """
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+
+    def _drain_future_exception(done_future: asyncio.Future) -> None:
+        if done_future.cancelled():
+            return
+        try:
+            done_future.exception()
+        except Exception:
+            # Accessing the exception is only for suppressing noisy asyncio logs.
+            pass
+
+    future.add_done_callback(_drain_future_exception)
+    return future
+
+
 async def _throttle_gemini_request_rate() -> None:
     """Process-local throttle to reduce bursty provider 429s."""
     global _LAST_GEMINI_REQUEST_TS
@@ -67,6 +91,29 @@ async def _throttle_gemini_request_rate() -> None:
 def _make_cache_key(payload: Dict[str, Any]) -> str:
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _get_chat_provider() -> str:
+    provider = (settings.AI_CHAT_PROVIDER or "gemini").strip().lower()
+    if provider not in {"gemini", "ollama"}:
+        raise MissingAIConfigError(
+            f"Unsupported AI_CHAT_PROVIDER '{settings.AI_CHAT_PROVIDER}'. Use 'gemini' or 'ollama'."
+        )
+    return provider
+
+
+def _normalize_ollama_model_name(model_name: str) -> str:
+    normalized = (model_name or "").strip()
+    if normalized.lower().startswith("ollama/"):
+        normalized = normalized.split("/", 1)[1]
+    return normalized
+
+
+def _safe_debug_log(message: str, data: Dict[str, Any], hypothesis_id: str = "H5") -> None:
+    try:
+        _debug_log(message=message, data=data, hypothesis_id=hypothesis_id)
+    except Exception:
+        pass
 
 
 def _prune_cache_if_needed(cache: Dict[str, Tuple[float, Any]]) -> None:
@@ -184,8 +231,7 @@ async def embed_texts(
                 return [cached[1]]
             inflight_future = _EMBED_INFLIGHT.get(embed_cache_key)
             if inflight_future is None:
-                loop = asyncio.get_running_loop()
-                inflight_future = loop.create_future()
+                inflight_future = _create_inflight_future()
                 _EMBED_INFLIGHT[embed_cache_key] = inflight_future
                 is_embed_owner = True
 
@@ -667,6 +713,107 @@ def _extract_text_from_gemini_response(data: Dict[str, Any]) -> str:
     return "\n".join(text_parts).strip()
 
 
+def _extract_text_from_openai_chat_response(data: Dict[str, Any]) -> str:
+    """Extract assistant text from an OpenAI-compatible chat completions response."""
+    choices = data.get("choices") or []
+    if not choices:
+        return ""
+    first_choice = choices[0] or {}
+    message = first_choice.get("message") or {}
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        text_parts: List[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    text_parts.append(text.strip())
+        return "\n".join(text_parts).strip()
+    return ""
+
+
+async def call_ollama_chat(
+    question: str,
+    context: str,
+    history: Optional[Sequence[Dict[str, str]]] = None,
+    use_rag_context: bool = True,
+) -> str:
+    """Call Ollama's OpenAI-compatible chat completions endpoint."""
+    model_name = _normalize_ollama_model_name(settings.OLLAMA_CHAT_MODEL)
+    if not model_name:
+        raise MissingAIConfigError("OLLAMA_CHAT_MODEL is not configured.")
+    if "ollama.com" in settings.OLLAMA_API_BASE and not settings.OLLAMA_API_KEY:
+        raise MissingAIConfigError(
+            "OLLAMA_API_KEY is required when OLLAMA_API_BASE points to ollama.com."
+        )
+
+    if use_rag_context and context.strip():
+        system_content_base = (
+            "You are an assistant for a student enrollment and credit management system.\n"
+            "Use the provided context as your primary source of truth.\n"
+            "If context is relevant, prioritize it over general knowledge.\n"
+            "When both 'Structured Context' and 'Retrieved Knowledge' are present:\n"
+            "- Prefer Structured Context for user-specific facts (counts, completed/failed courses, GPA, status).\n"
+            "- Use Retrieved Knowledge mainly for policy/background explanations.\n\n"
+            f"Context:\n{context}"
+        )
+    else:
+        system_content_base = (
+            "You are an assistant for a student enrollment and credit management system.\n"
+            "No knowledge-base context was retrieved for this question.\n"
+            "Answer using your general knowledge and reasoning.\n"
+            "If you are uncertain, say so briefly and provide the best helpful guidance."
+        )
+
+    messages: List[Dict[str, str]] = [{"role": "system", "content": system_content_base}]
+    if history:
+        for msg in history:
+            role = msg.get("role")
+            content = msg.get("content")
+            if role in {"system", "user", "assistant"} and isinstance(content, str) and content.strip():
+                messages.append({"role": role, "content": content.strip()})
+    messages.append({"role": "user", "content": question})
+
+    url = f"{settings.OLLAMA_API_BASE.rstrip('/')}/v1/chat/completions"
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+    if settings.OLLAMA_API_KEY:
+        headers["Authorization"] = f"Bearer {settings.OLLAMA_API_KEY}"
+
+    payload: Dict[str, Any] = {
+        "model": model_name,
+        "messages": messages,
+        "temperature": 0.2,
+        "stream": False,
+    }
+
+    async with httpx.AsyncClient(timeout=float(settings.OLLAMA_CHAT_TIMEOUT_SECONDS)) as client:
+        try:
+            resp = await client.post(url, headers=headers, json=payload)
+            if resp.status_code == 429:
+                retry_after_header = resp.headers.get("Retry-After")
+                wait_seconds = 5
+                if retry_after_header:
+                    try:
+                        wait_seconds = int(math.ceil(float(retry_after_header)))
+                    except ValueError:
+                        wait_seconds = 5
+                raise RateLimitedAIError(
+                    f"AI provider is rate-limited right now. Please retry in about {wait_seconds} seconds."
+                )
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise ChatServiceError(f"Error calling Ollama chat API: {exc}") from exc
+        except httpx.HTTPError as exc:
+            raise ChatServiceError(f"Error calling Ollama chat API: {exc}") from exc
+
+    content = _extract_text_from_openai_chat_response(resp.json())
+    if not content:
+        raise ChatServiceError("Ollama chat API returned an empty response.")
+    return content
+
+
 async def call_gemini_chat(
     question: str,
     context: str,
@@ -705,8 +852,7 @@ async def call_gemini_chat(
             return cached[1]
         inflight = _CHAT_INFLIGHT.get(chat_cache_key)
         if inflight is None:
-            loop = asyncio.get_running_loop()
-            inflight = loop.create_future()
+            inflight = _create_inflight_future()
             _CHAT_INFLIGHT[chat_cache_key] = inflight
             is_owner = True
         else:
@@ -1029,28 +1175,36 @@ async def chat_with_base_model(
 
     sources: List[Dict[str, Any]] = []
     rag_context = ""
+    rag_disabled_reason: Optional[str] = None
     if _should_use_rag(intent) and int(settings.AI_RAG_K) > 0:
-        embeddings = await embed_texts([question], task_type="RETRIEVAL_QUERY")
-        query_embedding = embeddings[0]
-        metadata_filter: Dict[str, Any] = {}
-        if intent == "announcements":
-            metadata_filter["metadata.type"] = "announcements"
-        program_type = _resolve_program_type_for_rag(
-            question=question,
-            current_user=current_user,
-            user_context=user_context,
-            domain_context=domain_context,
-        )
-        if program_type:
-            metadata_filter["metadata.program_type"] = program_type
-        rag_results = await vector_search_knowledge(
-            query_embedding=query_embedding,
-            limit=settings.AI_RAG_K,
-            num_candidates=settings.AI_RAG_NUM_CANDIDATES,
-            score_threshold=settings.AI_RAG_SCORE_THRESHOLD,
-            metadata_filter=metadata_filter or None,
-        )
-        rag_context, sources = _build_context_from_results(rag_results)
+        try:
+            embeddings = await embed_texts([question], task_type="RETRIEVAL_QUERY")
+            query_embedding = embeddings[0]
+            metadata_filter: Dict[str, Any] = {}
+            if intent == "announcements":
+                metadata_filter["metadata.type"] = "announcements"
+            program_type = _resolve_program_type_for_rag(
+                question=question,
+                current_user=current_user,
+                user_context=user_context,
+                domain_context=domain_context,
+            )
+            if program_type:
+                metadata_filter["metadata.program_type"] = program_type
+            rag_results = await vector_search_knowledge(
+                query_embedding=query_embedding,
+                limit=settings.AI_RAG_K,
+                num_candidates=settings.AI_RAG_NUM_CANDIDATES,
+                score_threshold=settings.AI_RAG_SCORE_THRESHOLD,
+                metadata_filter=metadata_filter or None,
+            )
+            rag_context, sources = _build_context_from_results(rag_results)
+        except (MissingAIConfigError, RateLimitedAIError, ChatServiceError) as exc:
+            rag_disabled_reason = str(exc)
+            _safe_debug_log(
+                message="RAG disabled for request; falling back to chat without retrieved knowledge",
+                data={"intent": intent, "reason": rag_disabled_reason},
+            )
 
     context_sections: List[str] = []
     if structured_context_text:
@@ -1077,6 +1231,7 @@ async def chat_with_base_model(
             "response_mode": response_mode,
             "realtime_context_used": bool(realtime_context),
             "realtime_context_keys": list(realtime_context.keys())[:20] if realtime_context else [],
+            "rag_disabled_reason": rag_disabled_reason,
             "rag_program_filter": _resolve_program_type_for_rag(
                 question=question,
                 current_user=current_user,
@@ -1087,12 +1242,21 @@ async def chat_with_base_model(
         hypothesis_id="H5",
     )
 
-    answer = await call_gemini_chat(
-        question=question,
-        context=combined_context,
-        history=history,
-        use_rag_context=bool(combined_context.strip()),
-    )
+    provider = _get_chat_provider()
+    if provider == "ollama":
+        answer = await call_ollama_chat(
+            question=question,
+            context=combined_context,
+            history=history,
+            use_rag_context=bool(combined_context.strip()),
+        )
+    else:
+        answer = await call_gemini_chat(
+            question=question,
+            context=combined_context,
+            history=history,
+            use_rag_context=bool(combined_context.strip()),
+        )
 
     return answer, sources
 
