@@ -364,7 +364,7 @@ async def upsert_exam_result(payload: ExamResultUpsertIn, db=Depends(get_db)):
         # Map to Enrollments collection format
         doc = {
             "student_id": payload.student_id,
-            "course_id": payload.course_code,  # Map course_code to course_id
+            "course_id": payload.course_code.upper(),  # Capitalize to maintain normalization
             "semesterAttend": semester_attend,
             "academic_year": compute_enrollment_academic_year(semester_attend),
             "status": status,
@@ -374,20 +374,17 @@ async def upsert_exam_result(payload: ExamResultUpsertIn, db=Depends(get_db)):
             "is_retake": status == "Failed",  # Set to True if student failed
         }
 
-        # Filter for upsert - unique by student, course, semesterAttend
-        filt = {
-            "student_id": payload.student_id,
-            "course_id": payload.course_code,
-            "semesterAttend": semester_attend,
-        }
-
-        # Try to find existing record first
+        # Try to find existing record first using regex for case-insensitivity AND semester match
         existing_doc = await enroll_col.find_one({
             "student_id": payload.student_id,
-            "course_id": payload.course_code
+            "course_id": {"$regex": f"^{payload.course_code.strip()}$", "$options": "i"},
+            "semesterAttend": {"$regex": f"{year_str}.*{sem_str}", "$options": "i"}
         })
         
         if existing_doc:
+            # Important: Keep the original formatting to not break the frontend list regex
+            doc["semesterAttend"] = existing_doc.get("semesterAttend", semester_attend)
+            
             # Update existing record, preserve is_retake if already True, otherwise set based on status
             current_is_retake = existing_doc.get("is_retake", False)
             # If student failed, mark as retake (or keep existing retake status)
