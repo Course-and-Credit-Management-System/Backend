@@ -113,32 +113,44 @@ async def get_students(
         query["$or"] = [
             {"user_id": search_re},
             {"name": search_re},
+            {"full_name": search_re},
+            {"first_name": search_re},
+            {"last_name": search_re},
             {"email": search_re},
         ]
 
     cursor = users_col.find(query)
+    all_users = await cursor.to_list(length=20000)
+    
+    # Batch fetch all progress records at once (N+1 fix)
+    user_ids = []
+    for doc in all_users:
+        sid = doc.get("user_id") or doc.get("id") or ""
+        if sid:
+            user_ids.append(sid)
+            
+    if user_ids:
+        progress_cursor = progress_col.find(
+            {"student_id": {"$in": user_ids}},
+            {"student_id": 1, "selected_major": 1}
+        )
+        async for pdoc in progress_cursor:
+            sid = pdoc.get("student_id")
+            if sid:
+                progress_cache[sid] = pdoc
+
     result = []
-    async for doc in cursor:
+    for doc in all_users:
         try:
             sp = doc.get("student_profile")
             if sp is None:
                 sp = {}
             sid = doc.get("user_id") or doc.get("id") or ""
 
-            # Prefer major from students_progress.selected_major when available
-            progress_doc = None
-            if sid:
-                if sid in progress_cache:
-                    progress_doc = progress_cache[sid]
-                else:
-                    progress_doc = await progress_col.find_one(
-                        {"student_id": sid},
-                        {"selected_major": 1},
-                    )
-                    progress_cache[sid] = progress_doc or {}
+            progress_doc = progress_cache.get(sid, {})
 
             # Major comes **only** from students_progress.selected_major for the list view
-            major_from_progress = str((progress_doc or {}).get("selected_major") or "").strip()
+            major_from_progress = str(progress_doc.get("selected_major") or "").strip()
 
             curr_yr = sp.get("current_year") or "1st Year, First Sem(new)"
             try:
