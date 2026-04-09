@@ -63,9 +63,9 @@ def get_result_tag(grade: str) -> str:
 
 def apply_retake_grade_logic(grade: str, status: str, is_retake: bool) -> str:
     """
-    Apply retake grade logic: if is_retake=true and status changed to passed, set grade to static C (2.0 points).
-    If still not passed, return original grade.
+    Apply retake grade logic: previously if is_retake=true and status changed to passed, set grade to static C (2.0 points).
+    Currently bypassing this limit so accurate grades are outputted.
     """
-    if is_retake and status in ["Passed", "Completed"]:
-        return "C"  # Static C grade (2.0 points) for passed retakes
+    # if is_retake and status in ["Passed", "Completed"]:
+    #     return "C"  # Static C grade (2.0 points) for passed retakes
     return grade  # Return original grade if not retake or not passed
