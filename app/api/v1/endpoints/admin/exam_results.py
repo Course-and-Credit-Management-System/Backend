@@ -198,18 +198,32 @@ async def list_exam_results(
 
     results = await db["Enrollments"].find(query).to_list(2000)
 
+    # Batch fetch usernames to avoid N+1 query problem
+    student_ids = []
+    for r in results:
+        if r.get("student_id"):
+            student_ids.append(r["student_id"])
+            
+    users_cache = {}
+    if student_ids:
+        users = await db["Users"].find(
+            {"user_id": {"$in": student_ids}},
+            {"_id": 0, "user_id": 1, "name": 1}
+        ).to_list(length=None)
+        
+        for u in users:
+            if u.get("user_id"):
+                users_cache[u["user_id"]] = u.get("name")
+
     out = []
     for r in results:
         r.pop("_id", None)
-        user = await db["Users"].find_one(
-            {"user_id": r["student_id"]},
-            {"_id": 0, "name": 1}
-        )
+        user_name = users_cache.get(r.get("student_id"))
         
         # Map Enrollments fields to ExamResults format for frontend compatibility
         mapped_result = {
-            "student_id": r["student_id"],
-            "student_name": user["name"] if user else None,
+            "student_id": r.get("student_id"),
+            "student_name": user_name,
             "course_code": r["course_id"],  # Map course_id to course_code
             "year": 1,  # Default value, not used in Enrollments
             "semester": 1,  # Default value, not used in Enrollments

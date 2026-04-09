@@ -237,6 +237,32 @@ class AdminDashboardService:
     async def list_students(self):
         students = await self.users.find({"role": "student"}).to_list(length=1000)
 
+        # Pre-fetch all passed enrollments for all students at once
+        student_ids = [s.get("user_id") or s.get("id") for s in students if (s.get("user_id") or s.get("id"))]
+        
+        all_passed = []
+        if student_ids:
+            all_passed = await self.enrollments.find(
+                {"student_id": {"$in": student_ids}, "status": {"$in": ["Passed", "Pass"]}}
+            ).to_list(length=None)
+            
+        # Pre-fetch all courses to map credits
+        course_codes = list({e.get("course_id") for e in all_passed if e.get("course_id")})
+        course_credits_map = {}
+        if course_codes:
+            courses = await self.courses.find({"course_code": {"$in": course_codes}}, {"course_code": 1, "credits": 1}).to_list(length=None)
+            for c in courses:
+                if c.get("course_code") and c.get("credits"):
+                    course_credits_map[c["course_code"]] = int(c["credits"])
+                    
+        # Group earned credits by student_id
+        student_credits = {}
+        for e in all_passed:
+            sid = e.get("student_id")
+            code = e.get("course_id")
+            if sid and code and code in course_credits_map:
+                student_credits[sid] = student_credits.get(sid, 0) + course_credits_map[code]
+
         for s in students:
             if "_id" in s:
                 s["_id"] = str(s["_id"])
@@ -244,19 +270,8 @@ class AdminDashboardService:
             sid = s.get("user_id") or s.get("id")
             sp = s.get("student_profile") or {}
 
-            # compute earned credits from Passed enrollments
-            earned = 0
-            if sid:
-                passed = await self.enrollments.find(
-                    {"student_id": sid, "status": {"$in": ["Passed"]}}
-                ).to_list(length=500)
-
-                for e in passed:
-                    code = e.get("course_id")
-                    if code:
-                        course = await self.courses.find_one({"course_code": code})
-                        if course and course.get("credits"):
-                            earned += int(course["credits"])
+            # compute earned credits from pre-calculated map
+            earned = student_credits.get(sid, 0)
 
             sp["credits_earned"] = earned
             sp["credits_required"] = sp.get("credits_required") or 120
@@ -310,16 +325,36 @@ class AdminDashboardService:
                 {"user_id": student_id},
             ]
         }
-        enrollments = await self.enrollments.find(enroll_query).to_list(length=200)
+        enrollments = await self.enrollments.find(enroll_query).to_list(length=500)
+
+        # Bulk-load course metadata once to avoid per-row DB calls.
+        course_tokens: set[str] = set()
+        for e in enrollments:
+            token = str(e.get("course_id") or e.get("course_code") or "").strip()
+            if token:
+                course_tokens.add(token)
+
+        course_cache: Dict[str, Dict[str, Any]] = {}
+        if course_tokens:
+            course_docs = await self.courses.find(
+                {"$or": [{"course_code": {"$in": list(course_tokens)}}, {"_id": {"$in": list(course_tokens)}}]}
+            ).to_list(length=500)
+            for c in course_docs:
+                code_key = str(c.get("course_code") or "").strip()
+                id_key = str(c.get("_id") or "").strip()
+                if code_key:
+                    course_cache[code_key] = c
+                if id_key:
+                    course_cache[id_key] = c
 
         # Credits: use total_credits_completed, or compute from Passed enrollments if missing
         total_credits = int(sp.get("total_credits_completed") or sp.get("total_credits") or 0)
         if total_credits == 0:
             for e in enrollments:
                 if (e.get("status") or "").lower() == "passed":
-                    code = e.get("course_id") or e.get("course_code")
+                    code = str(e.get("course_id") or e.get("course_code") or "").strip()
                     if code:
-                        c = await self.courses.find_one({"course_code": code})
+                        c = course_cache.get(code)
                         if c and c.get("credits"):
                             total_credits += int(c["credits"])
         required_credits = int(sp.get("credits_required") or sp.get("creditsRequired") or 120)
@@ -369,26 +404,6 @@ class AdminDashboardService:
             elif "second sem" in text or "semester 2" in text:
                 sem = 2
             return (year, sem)
-
-        # Bulk-load course metadata once to avoid per-row DB calls.
-        course_tokens: set[str] = set()
-        for e in enrollments:
-            token = str(e.get("course_id") or e.get("course_code") or "").strip()
-            if token:
-                course_tokens.add(token)
-
-        course_cache: Dict[str, Dict[str, Any]] = {}
-        if course_tokens:
-            course_docs = await self.courses.find(
-                {"$or": [{"course_code": {"$in": list(course_tokens)}}, {"_id": {"$in": list(course_tokens)}}]}
-            ).to_list(length=500)
-            for c in course_docs:
-                code_key = str(c.get("course_code") or "").strip()
-                id_key = str(c.get("_id") or "").strip()
-                if code_key:
-                    course_cache[code_key] = c
-                if id_key:
-                    course_cache[id_key] = c
 
         enrollment_rows = []
         semester_groups: Dict[str, List[Dict[str, Any]]] = {}
