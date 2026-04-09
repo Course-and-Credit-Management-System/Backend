@@ -113,11 +113,14 @@ async def get_students(
         query["$or"] = [
             {"user_id": search_re},
             {"name": search_re},
+            {"full_name": search_re},
+            {"first_name": search_re},
+            {"last_name": search_re},
             {"email": search_re},
         ]
 
     cursor = users_col.find(query)
-    all_users = await cursor.to_list(length=None)
+    all_users = await cursor.to_list(length=20000)
     
     # Batch fetch all progress records at once (N+1 fix)
     user_ids = []

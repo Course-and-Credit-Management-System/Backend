@@ -176,7 +176,7 @@ async def list_exam_results(
     
     # Map course_code to course_id for Enrollments collection
     if course_code: 
-        query["course_id"] = course_code
+        query["course_id"] = {"$regex": course_code.strip(), "$options": "i"}
     
     # For Enrollments, we need to filter by semesterAttend which contains year/semester info
     if year is not None and year != 0:
@@ -198,37 +198,77 @@ async def list_exam_results(
 
     results = await db["Enrollments"].find(query).to_list(2000)
 
-    # Batch fetch usernames to avoid N+1 query problem
-    student_ids = []
-    for r in results:
-        if r.get("student_id"):
-            student_ids.append(r["student_id"])
+    # Batch fetch usernames, sections, and majors to avoid N+1 query problem
+    student_ids = list(set([r["student_id"] for r in results if r.get("student_id")]))
             
     users_cache = {}
+    progress_cache = {}
+    
     if student_ids:
         users = await db["Users"].find(
             {"user_id": {"$in": student_ids}},
-            {"_id": 0, "user_id": 1, "name": 1}
+            {"_id": 0, "user_id": 1, "name": 1, "student_profile.section": 1}
         ).to_list(length=None)
         
         for u in users:
-            if u.get("user_id"):
-                users_cache[u["user_id"]] = u.get("name")
+            uid = u.get("user_id")
+            if uid:
+                sp = u.get("student_profile") or {}
+                users_cache[uid] = {
+                    "name": u.get("name"),
+                    "section": sp.get("section")
+                }
+                
+        # Get major from students_progress
+        col_names = await db.list_collection_names()
+        prog_col_name = "StudentsProgress" if "StudentsProgress" in col_names else "students_progress"
+        
+        progress_cursor = db[prog_col_name].find(
+            {"student_id": {"$in": student_ids}},
+            {"student_id": 1, "selected_major": 1}
+        )
+        async for pdoc in progress_cursor:
+            sid = pdoc.get("student_id")
+            if sid:
+                progress_cache[sid] = str(pdoc.get("selected_major") or "").strip()
 
     out = []
     for r in results:
         r.pop("_id", None)
-        user_name = users_cache.get(r.get("student_id"))
+        uid = r.get("student_id")
+        user_info = users_cache.get(uid, {})
+        user_name = user_info.get("name")
+        user_section = user_info.get("section")
+        
+        user_major = progress_cache.get(uid)
+        if user_major == "" or user_major is None:
+            user_major = "Unknown"
+            
+        # Post-filter by section and major (since Enrollments collection lacks these)
+        if section and section.lower() != "all" and str(user_section).lower() != str(section).lower():
+            continue
+        if major and major.lower() != "all" and str(user_major).lower() != str(major).lower():
+            continue
+            
+        # Try to infer year / semester from semesterAttend if needed for frontend map
+        sa = str(r.get("semesterAttend") or "").lower()
+        yr_val = 1
+        sem_val = 1
+        if "2nd" in sa or "second year" in sa: yr_val = 2
+        elif "3rd" in sa or "third year" in sa: yr_val = 3
+        elif "4th" in sa or "fourth year" in sa: yr_val = 4
+        elif "5th" in sa or "fifth year" in sa: yr_val = 5
+        if "second sem" in sa or "sem 2" in sa: sem_val = 2
         
         # Map Enrollments fields to ExamResults format for frontend compatibility
         mapped_result = {
-            "student_id": r.get("student_id"),
+            "student_id": uid,
             "student_name": user_name,
             "course_code": r["course_id"],  # Map course_id to course_code
-            "year": 1,  # Default value, not used in Enrollments
-            "semester": 1,  # Default value, not used in Enrollments
-            "section": None,  # Not available in Enrollments
-            "major": None,  # Not available in Enrollments
+            "year": yr_val if year is None else (year or yr_val), 
+            "semester": sem_val if semester is None else (semester or sem_val),
+            "section": user_section,
+            "major": user_major,
             "exam_score": r.get("scores", 0),  # Map scores to exam_score
             "grade": r.get("grade", "F"),
             "grade_point": r.get("points", 0),  # Map points to grade_point
